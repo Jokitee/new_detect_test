@@ -106,8 +106,12 @@ bool MvCamera::grab(cv::Mat& frame_out) {
     const int status = CameraGetImageBuffer(h_camera_, &frame_info, &raw_buf, cfg_.grab_timeout_ms);
     if (status != CAMERA_STATUS_SUCCESS || raw_buf == nullptr) {
         ++consecutive_timeouts_;
+        if (consecutive_timeouts_ == 1 || consecutive_timeouts_ % 5 == 0) {
+            std::cerr << "[MvCamera] CameraGetImageBuffer waiting/failed (status=" << status
+                      << ", count=" << consecutive_timeouts_ << ")" << std::endl;
+        }
         if (consecutive_timeouts_ >= 3 && CameraConnectTest(h_camera_) != CAMERA_STATUS_SUCCESS) {
-            std::cerr << "[MvCamera] Connection lost, attempting CameraReConnect...\n";
+            std::cerr << "[MvCamera] Connection lost, attempting CameraReConnect..." << std::endl;
             CameraReConnect(h_camera_);
             consecutive_timeouts_ = 0;
         }

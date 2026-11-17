@@ -9,7 +9,7 @@ namespace tav_pose {
 struct MvCameraConfig {
     int camera_index = 0;
     bool auto_exposure = false;
-    double exposure_us = 5000.0;
+    double exposure_us = 4000.0;  // 4 ms default exposure
     int gain_r = 100;
     int gain_g = 70;
     int gain_b = 50;
