@@ -67,6 +67,7 @@ struct Args {
     int gain_r = 100;
     int gain_g = 70;
     int gain_b = 50;
+    int frame_speed = 0;          // 0=low (VM USB safe), 1=normal, 2=high
     double fps = 0.0;       // 0 -> auto (30.0 for camera, source FPS for video)
     int max_frames = 0;     // 0 -> unlimited
     bool track = false;
@@ -99,7 +100,8 @@ void print_usage() {
         << "  --cam-idx <int>      Camera device index (default 0)\n"
         << "  --ae                 Enable auto exposure (default off / manual)\n"
         << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n"
-        << "  --gain r,g,b         ISP gain R,G,B (default 100,70,50)\n\n"
+        << "  --gain r,g,b         ISP gain R,G,B (default 100,70,50)\n"
+        << "  --frame-speed <idx>  Camera frame speed index 0=low..2=high (default 0)\n\n"
         << "Output options:\n"
         << "  --out <path>         Output video (.avi/.mp4) or image (.png) path\n"
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
@@ -159,6 +161,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--ae") a.auto_exposure = true;
         else if (k == "--exposure") a.exposure_us = std::stod(next());
         else if (k == "--gain") parse_gain(next(), a.gain_r, a.gain_g, a.gain_b);
+        else if (k == "--frame-speed") a.frame_speed = std::stoi(next());
         else if (k == "--fps") a.fps = std::stod(next());
         else if (k == "--max-frames") a.max_frames = std::max(0, std::stoi(next()));
         else if (k == "--track") a.track = true;
@@ -551,6 +554,7 @@ int run_stream_mode(const Args& args,
         cam_cfg.gain_r = args.gain_r;
         cam_cfg.gain_g = args.gain_g;
         cam_cfg.gain_b = args.gain_b;
+        cam_cfg.frame_speed = args.frame_speed;
         mv_cam.open(cam_cfg);
         if (target_fps <= 0.0) target_fps = 30.0;
     } else {

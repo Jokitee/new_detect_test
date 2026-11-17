@@ -1,5 +1,6 @@
 #include "tav_pose/mv_camera.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -65,7 +66,7 @@ void MvCamera::open(const MvCameraConfig& cfg) {
 
     isp_buffer_.assign(static_cast<size_t>(max_width_) * static_cast<size_t>(max_height_) * 3U, 0);
 
-    CameraPlay(h_camera_);
+    // Configure exposure, gain, pixel format, continuous trigger mode and frame speed before CameraPlay
     CameraSetAeState(h_camera_, cfg_.auto_exposure);
     if (!cfg_.auto_exposure && cfg_.exposure_us > 0.0) {
         const int exp_status = CameraSetExposureTime(h_camera_, cfg_.exposure_us);
@@ -82,6 +83,34 @@ void MvCamera::open(const MvCameraConfig& cfg) {
         is_mono_ = false;
         CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_BGR8);
     }
+
+    const int trig_status = CameraSetTriggerMode(h_camera_, 0);
+    if (trig_status != CAMERA_STATUS_SUCCESS) {
+        std::cerr << "[MvCamera] Warning: CameraSetTriggerMode(0) returned " << trig_status << "\n";
+    }
+
+    int applied_speed = cfg_.frame_speed;
+    if (cap.iFrameSpeedDesc > 0) {
+        applied_speed = std::max(0, std::min(cfg_.frame_speed, cap.iFrameSpeedDesc - 1));
+        const int spd_status = CameraSetFrameSpeed(h_camera_, applied_speed);
+        if (spd_status != CAMERA_STATUS_SUCCESS) {
+            std::cerr << "[MvCamera] Warning: CameraSetFrameSpeed(" << applied_speed
+                      << ") returned " << spd_status << "\n";
+        }
+    }
+
+    const int play_status = CameraPlay(h_camera_);
+    if (play_status != CAMERA_STATUS_SUCCESS) {
+        close();
+        std::ostringstream oss;
+        oss << "CameraPlay failed (status=" << play_status << ").";
+        throw std::runtime_error(oss.str());
+    }
+
+    int cur_trig = -1;
+    int cur_speed = -1;
+    CameraGetTriggerMode(h_camera_, &cur_trig);
+    CameraGetFrameSpeed(h_camera_, &cur_speed);
     consecutive_timeouts_ = 0;
 
     std::cout << "[MvCamera] Opened device #" << cfg_.camera_index
@@ -89,7 +118,9 @@ void MvCamera::open(const MvCameraConfig& cfg) {
               << ", " << (is_mono_ ? "MONO8" : "BGR8")
               << ", AE=" << (cfg_.auto_exposure ? "ON" : "OFF")
               << ", exp=" << cfg_.exposure_us << "us"
-              << ", gain=(" << cfg_.gain_r << "," << cfg_.gain_g << "," << cfg_.gain_b << "))\n";
+              << ", gain=(" << cfg_.gain_r << "," << cfg_.gain_g << "," << cfg_.gain_b << ")"
+              << ", trig=" << cur_trig
+              << ", speed=" << cur_speed << ")" << std::endl;
 #else
     (void)cfg;
     throw std::runtime_error(

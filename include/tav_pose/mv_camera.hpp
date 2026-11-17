@@ -13,6 +13,7 @@ struct MvCameraConfig {
     int gain_r = 100;
     int gain_g = 70;
     int gain_b = 50;
+    int frame_speed = 0;          // 0=low (safest for VM USB), 1=normal, 2=high
     int grab_timeout_ms = 1000;
 };
 
