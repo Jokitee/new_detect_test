@@ -130,7 +130,9 @@ Args parse_args(int argc, char** argv) {
             if (i + 1 >= argc) throw std::runtime_error("Missing value for " + k);
             return argv[++i];
         };
-        if (k == "--camera") {
+        if (k == "--") {
+            continue;
+        } else if (k == "--camera") {
             a.mode = InputMode::Camera;
         } else if (k == "--video") {
             a.mode = InputMode::Video;

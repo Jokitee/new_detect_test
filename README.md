@@ -35,10 +35,10 @@ Captures frames continuously without frame limit (`max_frames=0`) using the Mind
 
 ```bash
 # Headless unlimited recording -> out/mv_detect.mp4 (or automatic .avi fallback)
-xmake run new_detect_test -- --camera --out out/mv_detect.mp4 --fps 30 --exposure 5000 --gain 100,70,50
+xmake run new_detect_test --camera --out out/mv_detect.mp4 --fps 30 --exposure 5000 --gain 100,70,50
 
 # Live preview window + unlimited video recording + temporal tracking
-xmake run new_detect_test -- --camera --show --track --out out/mv_detect.avi
+xmake run new_detect_test --camera --show --track --out out/mv_detect.avi
 ```
 
 Note: if OpenCV lacks FFmpeg/H.264 support when requesting `.mp4`, the writer automatically falls back to `MJPG` `.avi` so video saving succeeds.
@@ -46,12 +46,12 @@ Note: if OpenCV lacks FFmpeg/H.264 support when requesting `.mp4`, the writer au
 ### 2. Offline Video File -> Video Output
 
 ```bash
-xmake run new_detect_test -- --video input.mp4 --out out/pred.avi --show
+xmake run new_detect_test --video input.mp4 --out out/pred.avi --show
 ```
 
 ### 3. Single Image Test & Latency Benchmark
 
 ```bash
-xmake run new_detect_test -- --image ../../Photo/261118.jpg --bench 50
-xmake run new_detect_test -- --image ../../Photo/IMG_20261117141856.jpg --roi 305,108,464,431 --cls 3
+xmake run new_detect_test --image ../../Photo/261118.jpg --bench 50
+xmake run new_detect_test --image ../../Photo/IMG_20261117141856.jpg --roi 305,108,464,431 --cls 3
 ```
