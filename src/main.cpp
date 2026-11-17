@@ -14,6 +14,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -52,7 +53,7 @@ struct Args {
     int imgsz = 416;
     float conf = 0.25f;
     bool use_bgr = false;
-    bool show = false;
+    int show = -1;  // -1: auto (on in stream mode when GUI display exists), 0: off, 1: on
     int bench_runs = 0;
     double fx = 1400.0;
     double cx = -1.0;
@@ -104,7 +105,8 @@ void print_usage() {
         << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
         << "  --max-frames <N>     Optional frame limit (default 0 = unlimited until Ctrl+C/q/ESC)\n"
         << "  --vis-gain <double>  Display brightness gain (<=0 = auto 3x on dark frames)\n"
-        << "  --show               Display live OpenCV window (press q or ESC to stop)\n";
+        << "  --show               Force live cv::imshow window (auto-on in camera/video mode if DISPLAY exists)\n"
+        << "  --no-show            Disable cv::imshow window (headless recording)\n";
 }
 
 void parse_gain(const std::string& s, int& r, int& g, int& b) {
@@ -162,7 +164,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--redetect-every") a.redetect_every = std::max(1, std::stoi(next()));
         else if (k == "--vis-gain") a.vis_gain = std::stod(next());
         else if (k == "--bgr") a.use_bgr = true;
-        else if (k == "--show") a.show = true;
+        else if (k == "--show") a.show = 1;
+        else if (k == "--no-show") a.show = 0;
         else if (k == "-h" || k == "--help") {
             print_usage();
             std::exit(0);
@@ -444,6 +447,18 @@ tav_pose::CameraIntrinsics build_intrinsics(const Args& args, const cv::Mat& gra
     return K;
 }
 
+bool resolve_show(const Args& args) {
+    if (args.show >= 0) return args.show > 0;
+    if (args.mode == InputMode::Image) return false;
+#ifdef _WIN32
+    return true;
+#else
+    const char* d = std::getenv("DISPLAY");
+    const char* w = std::getenv("WAYLAND_DISPLAY");
+    return (d && d[0] != '\0') || (w && w[0] != '\0');
+#endif
+}
+
 int run_image_mode(const Args& args,
                    const tav_pose::YoloDetector* detector,
                    const std::vector<tav_pose::CharTemplate>& bank) {
@@ -525,7 +540,7 @@ int run_image_mode(const Args& args,
     }
     std::cout << "Saved overlay -> " << out_path << "\n";
 
-    if (args.show) {
+    if (resolve_show(args)) {
         cv::imshow("new_detect_test", vis);
         cv::waitKey(0);
     }
@@ -571,6 +586,7 @@ int run_stream_mode(const Args& args,
 
     cv::VideoWriter writer;
     TrackState track_state;
+    const bool show_window = resolve_show(args);
     long long frame_idx = 0;
     long long total_timeouts = 0;
     double ema_fps = 0.0;
@@ -579,10 +595,11 @@ int run_stream_mode(const Args& args,
     std::cout << "[Main] Stream started (mode="
               << (args.mode == InputMode::Camera ? "MindVision Camera" : "Video File")
               << ", track=" << (args.track ? "ON" : "OFF")
+              << ", show=" << (show_window ? "ON" : "OFF")
               << ", max_frames="
               << (args.max_frames > 0 ? std::to_string(args.max_frames) : std::string("unlimited"))
               << "). Press Ctrl+C"
-              << (args.show ? " or q/ESC in preview window" : "")
+              << (show_window ? " or q/ESC in preview window" : "")
               << " to stop and finalize video.\n";
 
     cv::Mat frame, gray, vis;
@@ -594,7 +611,7 @@ int run_stream_mode(const Args& args,
             got = mv_cam.grab(frame);
             if (!got) {
                 ++total_timeouts;
-                if (args.show) {
+                if (show_window) {
                     const int key = cv::waitKey(1) & 0xFF;
                     if (key == 'q' || key == 'Q' || key == 27) break;
                 }
@@ -643,10 +660,11 @@ int run_stream_mode(const Args& args,
             std::fflush(stdout);
         }
 
-        if (args.show) {
+        if (show_window) {
             cv::imshow("new_detect_test", vis);
             const int key = cv::waitKey(1) & 0xFF;
-            if (key == 'q' || key == 'Q' || key == 27) {
+            if (key == 'q' || key == 'Q' || key == 27 ||
+                cv::getWindowProperty("new_detect_test", cv::WND_PROP_VISIBLE) < 1) {
                 break;
             }
         }
@@ -659,7 +677,7 @@ int run_stream_mode(const Args& args,
     if (video_cap.isOpened()) {
         video_cap.release();
     }
-    if (args.show) {
+    if (show_window) {
         cv::destroyAllWindows();
     }
 
