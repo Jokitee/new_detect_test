@@ -1,0 +1,6 @@
+build/
+.xmake/
+out/
+*.exe
+*.pdb
+

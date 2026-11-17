@@ -1,0 +1,704 @@
+#include "tav_pose/mv_camera.hpp"
+#include "tav_pose/sparse_edge_pose.hpp"
+#include "tav_pose/yolo_detector.hpp"
+
+#include <opencv2/core/utility.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void handle_signal(int) {
+    g_stop_requested = 1;
+}
+
+enum class InputMode {
+    Camera,
+    Video,
+    Image,
+};
+
+struct Args {
+    InputMode mode = InputMode::Camera;
+    std::string image_path;
+    std::string video_path;
+    std::string model_path = "assets/char3_det_416.onnx";
+    std::string templates_path = "assets/templates.csv";
+    std::string out_path;
+    std::string roi_str;
+    std::string cls_name = "3";
+    std::string codec;
+    int imgsz = 416;
+    float conf = 0.25f;
+    bool use_bgr = false;
+    bool show = false;
+    int bench_runs = 0;
+    double fx = 1400.0;
+    double cx = -1.0;
+    double cy = -1.0;
+
+    // Camera & video output options
+    int cam_idx = 0;
+    bool auto_exposure = false;
+    double exposure_us = 5000.0;
+    int gain_r = 100;
+    int gain_g = 70;
+    int gain_b = 50;
+    double fps = 0.0;       // 0 -> auto (30.0 for camera, source FPS for video)
+    int max_frames = 0;     // 0 -> unlimited
+    bool track = false;
+    int redetect_every = 15;
+    double vis_gain = 0.0;  // <= 0 -> auto brightness boost on dark frames
+};
+
+void print_usage() {
+    std::cout
+        << "Usage: new_detect_test [mode] [options]\n"
+        << "Modes (defaults to --camera when neither --image nor --video is given):\n"
+        << "  --camera             Live MindVision camera stream -> OpenCV VideoWriter output\n"
+        << "  --video <path>       Offline video file -> OpenCV VideoWriter output\n"
+        << "  --image <path>       Single image inference -> PNG output\n\n"
+        << "Detection & Pure-M1 Pose options:\n"
+        << "  --model <onnx>       YOLOv8n ONNX path (default assets/char3_det_416.onnx)\n"
+        << "  --templates <csv>    3D sparse contour CSV (default assets/templates.csv)\n"
+        << "  --imgsz <int>        YOLO input size (default 416)\n"
+        << "  --conf <float>       YOLO confidence threshold (default 0.25)\n"
+        << "  --bgr                Feed raw BGR instead of grayscale-BGR\n"
+        << "  --f <double>         Focal length px (default 1400.0)\n"
+        << "  --cx <double>        Principal point cx (default image width/2)\n"
+        << "  --cy <double>        Principal point cy (default image height/2)\n"
+        << "  --roi x0,y0,x1,y1    Skip YOLO and use manual box\n"
+        << "  --cls 3|4|7          Character class when using --roi (default 3)\n"
+        << "  --track              Enable temporal Pure-M1 tracking between YOLO keyframes\n"
+        << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
+        << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"
+        << "MindVision Camera options:\n"
+        << "  --cam-idx <int>      Camera device index (default 0)\n"
+        << "  --ae                 Enable auto exposure (default off / manual)\n"
+        << "  --exposure <us>      Manual exposure time in us (default 5000)\n"
+        << "  --gain r,g,b         ISP gain R,G,B (default 100,70,50)\n\n"
+        << "Output options:\n"
+        << "  --out <path>         Output video (.avi/.mp4) or image (.png) path\n"
+        << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
+        << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
+        << "  --max-frames <N>     Stop automatically after N frames (default 0 = until q/ESC/Ctrl+C)\n"
+        << "  --vis-gain <double>  Display brightness gain (<=0 = auto 3x on dark frames)\n"
+        << "  --show               Display live OpenCV window (press q or ESC to stop)\n";
+}
+
+void parse_gain(const std::string& s, int& r, int& g, int& b) {
+    std::stringstream ss(s);
+    std::string tok;
+    int vals[3]{};
+    for (int i = 0; i < 3; ++i) {
+        if (!std::getline(ss, tok, ',')) {
+            throw std::runtime_error("Invalid --gain format (expected r,g,b): " + s);
+        }
+        vals[i] = std::stoi(tok);
+    }
+    r = vals[0];
+    g = vals[1];
+    b = vals[2];
+}
+
+Args parse_args(int argc, char** argv) {
+    Args a;
+    for (int i = 1; i < argc; ++i) {
+        std::string k = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) throw std::runtime_error("Missing value for " + k);
+            return argv[++i];
+        };
+        if (k == "--camera") {
+            a.mode = InputMode::Camera;
+        } else if (k == "--video") {
+            a.mode = InputMode::Video;
+            a.video_path = next();
+        } else if (k == "--image") {
+            a.mode = InputMode::Image;
+            a.image_path = next();
+        } else if (k == "--model") a.model_path = next();
+        else if (k == "--templates") a.templates_path = next();
+        else if (k == "--out") a.out_path = next();
+        else if (k == "--roi") a.roi_str = next();
+        else if (k == "--cls") a.cls_name = next();
+        else if (k == "--codec") a.codec = next();
+        else if (k == "--imgsz") a.imgsz = std::stoi(next());
+        else if (k == "--conf") a.conf = std::stof(next());
+        else if (k == "--f") a.fx = std::stod(next());
+        else if (k == "--cx") a.cx = std::stod(next());
+        else if (k == "--cy") a.cy = std::stod(next());
+        else if (k == "--bench") a.bench_runs = std::stoi(next());
+        else if (k == "--cam-idx") a.cam_idx = std::stoi(next());
+        else if (k == "--ae") a.auto_exposure = true;
+        else if (k == "--exposure") a.exposure_us = std::stod(next());
+        else if (k == "--gain") parse_gain(next(), a.gain_r, a.gain_g, a.gain_b);
+        else if (k == "--fps") a.fps = std::stod(next());
+        else if (k == "--max-frames") a.max_frames = std::max(0, std::stoi(next()));
+        else if (k == "--track") a.track = true;
+        else if (k == "--redetect-every") a.redetect_every = std::max(1, std::stoi(next()));
+        else if (k == "--vis-gain") a.vis_gain = std::stod(next());
+        else if (k == "--bgr") a.use_bgr = true;
+        else if (k == "--show") a.show = true;
+        else if (k == "-h" || k == "--help") {
+            print_usage();
+            std::exit(0);
+        } else {
+            throw std::runtime_error("Unknown option: " + k + " (pass --help for usage)");
+        }
+    }
+    return a;
+}
+
+cv::Rect2f parse_roi(const std::string& s) {
+    std::stringstream ss(s);
+    std::string tok;
+    float v[4]{};
+    for (int i = 0; i < 4; ++i) {
+        if (!std::getline(ss, tok, ',')) throw std::runtime_error("Invalid --roi format");
+        v[i] = std::stof(tok);
+    }
+    return cv::Rect2f(v[0], v[1], v[2] - v[0], v[3] - v[1]);
+}
+
+const tav_pose::CharTemplate* find_template(const std::vector<tav_pose::CharTemplate>& bank,
+                                            const std::string& name,
+                                            int cls_id) {
+    for (const auto& t : bank) {
+        if (!name.empty() && t.name == name) return &t;
+    }
+    for (const auto& t : bank) {
+        if (t.cls_id == cls_id) return &t;
+    }
+    return bank.empty() ? nullptr : &bank[0];
+}
+
+struct PoseTarget {
+    tav_pose::Detection det;
+    const tav_pose::CharTemplate* tpl = nullptr;
+    tav_pose::PoseResult pose;
+};
+
+struct TrackState {
+    std::vector<PoseTarget> items;
+    int frames_since_det = 0;
+};
+
+struct FrameMetrics {
+    double det_ms = 0.0;
+    double pose_ms = 0.0;
+    bool used_tracking = false;
+    std::vector<PoseTarget> targets;
+};
+
+cv::Rect2f projected_bbox(const std::vector<cv::Point2d>& pts, int width, int height, float pad = 6.0f) {
+    double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
+    for (const auto& p : pts) {
+        min_x = std::min(min_x, p.x);
+        min_y = std::min(min_y, p.y);
+        max_x = std::max(max_x, p.x);
+        max_y = std::max(max_y, p.y);
+    }
+    const float x0 = std::max(0.0f, static_cast<float>(min_x) - pad);
+    const float y0 = std::max(0.0f, static_cast<float>(min_y) - pad);
+    const float x1 = std::min(static_cast<float>(width - 1), static_cast<float>(max_x) + pad);
+    const float y1 = std::min(static_cast<float>(height - 1), static_cast<float>(max_y) + pad);
+    return cv::Rect2f(x0, y0, std::max(1.0f, x1 - x0), std::max(1.0f, y1 - y0));
+}
+
+bool try_temporal_tracking(const cv::Mat& gray,
+                           const tav_pose::CameraIntrinsics& K,
+                           const Args& args,
+                           TrackState& track,
+                           FrameMetrics& metrics) {
+    if (!args.track || !args.roi_str.empty() || track.items.empty() ||
+        track.frames_since_det >= args.redetect_every) {
+        return false;
+    }
+
+    std::vector<PoseTarget> updated;
+    updated.reserve(track.items.size());
+    double pose_ms_sum = 0.0;
+
+    for (const auto& prev : track.items) {
+        if (!prev.tpl) return false;
+        const auto pose = tav_pose::SparseEdgePoseSolver::solve_tracking(
+            gray, prev.pose.rvec, prev.pose.tvec, *prev.tpl, K);
+        pose_ms_sum += pose.solve_ms;
+        if (!pose.valid || pose.edge_frac < 0.55 || pose.edge_med_px > 3.5) {
+            return false;
+        }
+        const auto pts = tav_pose::SparseEdgePoseSolver::project_points(
+            *prev.tpl, pose.rvec, pose.tvec, K);
+        PoseTarget cur = prev;
+        cur.pose = pose;
+        cur.det.box = projected_bbox(pts, gray.cols, gray.rows);
+        updated.push_back(std::move(cur));
+    }
+
+    metrics.det_ms = 0.0;
+    metrics.pose_ms = pose_ms_sum;
+    metrics.used_tracking = true;
+    metrics.targets = updated;
+    track.items = std::move(updated);
+    ++track.frames_since_det;
+    return true;
+}
+
+FrameMetrics process_frame(const cv::Mat& frame,
+                           const cv::Mat& gray,
+                           const tav_pose::YoloDetector* detector,
+                           const std::vector<tav_pose::CharTemplate>& bank,
+                           const tav_pose::CameraIntrinsics& K,
+                           const Args& args,
+                           TrackState* track_state,
+                           cv::Mat& vis_out) {
+    FrameMetrics metrics;
+
+    const bool tracked =
+        track_state && try_temporal_tracking(gray, K, args, *track_state, metrics);
+
+    if (!tracked) {
+        std::vector<tav_pose::Detection> dets;
+        if (!args.roi_str.empty()) {
+            tav_pose::Detection d;
+            d.box = parse_roi(args.roi_str);
+            d.cls_name = args.cls_name;
+            d.conf = 1.0f;
+            dets.push_back(d);
+        } else if (detector) {
+            const auto t0 = std::chrono::steady_clock::now();
+            dets = detector->detect(frame);
+            const auto t1 = std::chrono::steady_clock::now();
+            metrics.det_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+
+        for (const auto& d : dets) {
+            const auto* tpl = find_template(bank, d.cls_name, d.cls_id);
+            if (!tpl) continue;
+            PoseTarget item;
+            item.det = d;
+            item.tpl = tpl;
+            item.pose = tav_pose::SparseEdgePoseSolver::solve_cold_start(gray, d.box, *tpl, K);
+            if (item.pose.valid) {
+                metrics.pose_ms += item.pose.solve_ms;
+            }
+            metrics.targets.push_back(std::move(item));
+        }
+
+        if (track_state) {
+            track_state->items.clear();
+            for (const auto& t : metrics.targets) {
+                if (t.pose.valid) track_state->items.push_back(t);
+            }
+            track_state->frames_since_det = 0;
+        }
+    }
+
+    cv::Mat vis_bgr;
+    if (frame.channels() == 1) {
+        cv::cvtColor(frame, vis_bgr, cv::COLOR_GRAY2BGR);
+    } else {
+        vis_bgr = frame;
+    }
+
+    const double gain = (args.vis_gain > 0.0)
+                            ? args.vis_gain
+                            : ((cv::mean(gray)[0] < 60.0) ? 3.0 : 1.0);
+    vis_bgr.convertTo(vis_out, -1, gain, 0.0);
+
+    for (const auto& item : metrics.targets) {
+        if (!item.pose.valid || !item.tpl) continue;
+
+        const cv::Scalar box_color =
+            metrics.used_tracking ? cv::Scalar(0, 220, 255) : cv::Scalar(255, 200, 0);
+        cv::rectangle(vis_out, item.det.box, box_color, 2);
+
+        const auto pts = tav_pose::SparseEdgePoseSolver::project_points(
+            *item.tpl, item.pose.rvec, item.pose.tvec, K);
+        for (const auto& q : pts) {
+            cv::circle(vis_out,
+                       cv::Point(static_cast<int>(std::round(q.x)),
+                                 static_cast<int>(std::round(q.y))),
+                       2, cv::Scalar(0, 255, 0), -1);
+        }
+
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s (%.2f) ypr=(%+.1f,%+.1f,%+.1f) z=%.0fmm",
+                      item.det.cls_name.c_str(), item.det.conf,
+                      item.pose.euler_yxz_deg[0], item.pose.euler_yxz_deg[1],
+                      item.pose.euler_yxz_deg[2], item.pose.tvec[2]);
+        int baseline = 0;
+        const cv::Size tsz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, 0.48, 1, &baseline);
+        const int tx = std::max(4, std::min(static_cast<int>(std::round(item.det.box.x)),
+                                            std::max(4, vis_out.cols - tsz.width - 6)));
+        const int ty = std::max(18, static_cast<int>(std::round(item.det.box.y)) - 6);
+        cv::putText(vis_out, buf, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX,
+                    0.48, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    }
+
+    return metrics;
+}
+
+void draw_hud(cv::Mat& vis,
+              int frame_idx,
+              double fps,
+              const FrameMetrics& metrics,
+              size_t valid_count) {
+    char hud[192];
+    std::snprintf(hud, sizeof(hud),
+                  "Frame %d | FPS %.1f | %s %.1fms | M1 %.2fms | targets %zu",
+                  frame_idx, fps, metrics.used_tracking ? "TRK" : "DET",
+                  metrics.det_ms, metrics.pose_ms, valid_count);
+    cv::putText(vis, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX,
+                0.6, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+}
+
+std::string to_lower(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+int fourcc_from_str(const std::string& code) {
+    if (code.size() != 4) {
+        throw std::runtime_error("Codec must be a 4-character FOURCC (got '" + code + "')");
+    }
+    return cv::VideoWriter::fourcc(code[0], code[1], code[2], code[3]);
+}
+
+bool open_video_writer(cv::VideoWriter& writer,
+                       std::string& out_path,
+                       double fps,
+                       const cv::Size& frame_size,
+                       const std::string& requested_codec) {
+    const fs::path p(out_path);
+    if (p.has_parent_path()) {
+        fs::create_directories(p.parent_path());
+    }
+
+    const std::string ext = to_lower(p.extension().string());
+    std::vector<std::string> codecs;
+    if (!requested_codec.empty()) {
+        codecs.push_back(requested_codec);
+    } else if (ext == ".mp4" || ext == ".mkv" || ext == ".mov") {
+        codecs = {"mp4v", "avc1", "H264", "MJPG"};
+    } else {
+        codecs = {"MJPG", "XVID", "mp4v"};
+    }
+
+    for (const auto& c : codecs) {
+        if (writer.open(out_path, fourcc_from_str(c), fps, frame_size, true)) {
+            std::cout << "[VideoWriter] OpenCV " << CV_VERSION << " recording "
+                      << frame_size.width << "x" << frame_size.height
+                      << " @ " << fps << " FPS (codec=" << c << ") -> " << out_path << "\n";
+            return true;
+        }
+    }
+
+    if (ext != ".avi") {
+        fs::path fallback = p;
+        fallback.replace_extension(".avi");
+        std::string fallback_str = fallback.string();
+        if (writer.open(fallback_str, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
+                        fps, frame_size, true)) {
+            std::cerr << "[VideoWriter] Warning: failed to open '" << out_path
+                      << "'; fell back to MJPG AVI -> " << fallback_str << "\n";
+            out_path = fallback_str;
+            return true;
+        }
+    }
+    return false;
+}
+
+tav_pose::CameraIntrinsics build_intrinsics(const Args& args, const cv::Mat& gray) {
+    tav_pose::CameraIntrinsics K;
+    K.fx = args.fx;
+    K.fy = args.fx;
+    K.cx = (args.cx >= 0.0) ? args.cx : gray.cols * 0.5;
+    K.cy = (args.cy >= 0.0) ? args.cy : gray.rows * 0.5;
+    return K;
+}
+
+int run_image_mode(const Args& args,
+                   const tav_pose::YoloDetector* detector,
+                   const std::vector<tav_pose::CharTemplate>& bank) {
+    std::ifstream imf(fs::u8path(args.image_path), std::ios::binary | std::ios::ate);
+    if (!imf.is_open()) {
+        std::cerr << "Failed to open image: " << args.image_path << "\n";
+        return 1;
+    }
+    std::vector<uchar> raw_bytes(static_cast<size_t>(imf.tellg()));
+    imf.seekg(0, std::ios::beg);
+    imf.read(reinterpret_cast<char*>(raw_bytes.data()), static_cast<std::streamsize>(raw_bytes.size()));
+    cv::Mat bgr = cv::imdecode(raw_bytes, cv::IMREAD_COLOR);
+    if (bgr.empty()) {
+        std::cerr << "Failed to decode image: " << args.image_path << "\n";
+        return 1;
+    }
+
+    cv::Mat gray;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    const auto K = build_intrinsics(args, gray);
+
+    if (args.bench_runs > 0 && detector) {
+        detector->detect(bgr);
+    }
+
+    cv::Mat vis;
+    const FrameMetrics metrics = process_frame(bgr, gray, detector, bank, K, args, nullptr, vis);
+
+    std::printf("Image: %s (%dx%d), f=%.1f px, detections=%zu, det_time=%.2f ms\n",
+                args.image_path.c_str(), gray.cols, gray.rows, K.fx,
+                metrics.targets.size(), metrics.det_ms);
+
+    for (size_t i = 0; i < metrics.targets.size(); ++i) {
+        const auto& item = metrics.targets[i];
+        if (!item.pose.valid) {
+            std::printf("  [%zu] cls=%s conf=%.2f -> M1 failed\n",
+                        i, item.det.cls_name.c_str(), item.det.conf);
+            continue;
+        }
+        std::printf("  [%zu] cls=%s conf=%.2f box=[%.0f, %.0f, %.0f, %.0f]\n",
+                    i, item.det.cls_name.c_str(), item.det.conf,
+                    item.det.box.x, item.det.box.y,
+                    item.det.box.x + item.det.box.width,
+                    item.det.box.y + item.det.box.height);
+        std::printf("      M1 (Pure C++): ypr=(%+.1f, %+.1f, %+.1f) deg  t=(%+.1f, %+.1f, %.1f)mm  "
+                    "edge=%.2fpx (%.0f%%)  mirror_gap=%.3f  time=%.2f ms\n",
+                    item.pose.euler_yxz_deg[0], item.pose.euler_yxz_deg[1],
+                    item.pose.euler_yxz_deg[2], item.pose.tvec[0], item.pose.tvec[1],
+                    item.pose.tvec[2], item.pose.edge_med_px, 100.0 * item.pose.edge_frac,
+                    item.pose.mirror_gap, item.pose.solve_ms);
+
+        if (args.bench_runs > 0 && item.tpl) {
+            double sum_cold = 0.0, sum_trk = 0.0;
+            for (int r = 0; r < args.bench_runs; ++r) {
+                sum_cold += tav_pose::SparseEdgePoseSolver::solve_cold_start(
+                                gray, item.det.box, *item.tpl, K)
+                                .solve_ms;
+                sum_trk += tav_pose::SparseEdgePoseSolver::solve_tracking(
+                               gray, item.pose.rvec, item.pose.tvec, *item.tpl, K)
+                               .solve_ms;
+            }
+            std::printf("      Benchmark (%d runs): cold_avg=%.3f ms  track_avg=%.3f ms\n",
+                        args.bench_runs, sum_cold / args.bench_runs, sum_trk / args.bench_runs);
+        }
+    }
+
+    std::string out_path = args.out_path;
+    if (out_path.empty()) {
+        out_path = "out/cpp_pred_" + fs::path(args.image_path).stem().string() + ".png";
+    }
+    const fs::path op(out_path);
+    if (op.has_parent_path()) fs::create_directories(op.parent_path());
+
+    std::vector<uchar> out_buf;
+    if (cv::imencode(".png", vis, out_buf)) {
+        std::ofstream ofs(fs::u8path(out_path), std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(out_buf.data()),
+                  static_cast<std::streamsize>(out_buf.size()));
+    }
+    std::cout << "Saved overlay -> " << out_path << "\n";
+
+    if (args.show) {
+        cv::imshow("new_detect_test", vis);
+        cv::waitKey(0);
+    }
+    return 0;
+}
+
+int run_stream_mode(const Args& args,
+                    const tav_pose::YoloDetector* detector,
+                    const std::vector<tav_pose::CharTemplate>& bank) {
+    tav_pose::MvCamera mv_cam;
+    cv::VideoCapture video_cap;
+    double target_fps = args.fps;
+
+    if (args.mode == InputMode::Camera) {
+        tav_pose::MvCameraConfig cam_cfg;
+        cam_cfg.camera_index = args.cam_idx;
+        cam_cfg.auto_exposure = args.auto_exposure;
+        cam_cfg.exposure_us = args.exposure_us;
+        cam_cfg.gain_r = args.gain_r;
+        cam_cfg.gain_g = args.gain_g;
+        cam_cfg.gain_b = args.gain_b;
+        mv_cam.open(cam_cfg);
+        if (target_fps <= 0.0) target_fps = 30.0;
+    } else {
+        if (!video_cap.open(args.video_path)) {
+            std::cerr << "Failed to open input video: " << args.video_path << "\n";
+            return 1;
+        }
+        if (target_fps <= 0.0) {
+            const double src_fps = video_cap.get(cv::CAP_PROP_FPS);
+            target_fps = (src_fps > 1.0 && src_fps < 240.0) ? src_fps : 30.0;
+        }
+    }
+
+    std::string out_path = args.out_path;
+    if (out_path.empty()) {
+        if (args.mode == InputMode::Camera) {
+            out_path = "out/mv_detect.avi";
+        } else {
+            out_path = "out/video_pred_" + fs::path(args.video_path).stem().string() + ".avi";
+        }
+    }
+
+    cv::VideoWriter writer;
+    TrackState track_state;
+    int frame_idx = 0;
+    int total_timeouts = 0;
+    double ema_fps = 0.0;
+    auto prev_tick = std::chrono::steady_clock::now();
+
+    std::cout << "[Main] Stream started (mode="
+              << (args.mode == InputMode::Camera ? "MindVision Camera" : "Video File")
+              << ", track=" << (args.track ? "ON" : "OFF")
+              << "). Press Ctrl+C"
+              << (args.show ? " or q/ESC in preview window" : "")
+              << " to stop and finalize video.\n";
+
+    cv::Mat frame, gray, vis;
+    while (!g_stop_requested) {
+        if (args.max_frames > 0 && frame_idx >= args.max_frames) break;
+
+        bool got = false;
+        if (args.mode == InputMode::Camera) {
+            got = mv_cam.grab(frame);
+            if (!got) {
+                ++total_timeouts;
+                if (args.show) {
+                    const int key = cv::waitKey(1) & 0xFF;
+                    if (key == 'q' || key == 'Q' || key == 27) break;
+                }
+                continue;
+            }
+        } else {
+            got = video_cap.read(frame);
+            if (!got || frame.empty()) break;
+        }
+
+        if (frame.channels() == 1) {
+            gray = frame;
+        } else {
+            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        }
+
+        if (!writer.isOpened()) {
+            if (!open_video_writer(writer, out_path, target_fps, gray.size(), args.codec)) {
+                std::cerr << "Failed to open OpenCV VideoWriter for " << out_path << "\n";
+                return 1;
+            }
+        }
+
+        const auto K = build_intrinsics(args, gray);
+        const FrameMetrics metrics = process_frame(
+            frame, gray, detector, bank, K, args, args.track ? &track_state : nullptr, vis);
+
+        const auto now_tick = std::chrono::steady_clock::now();
+        const double loop_s = std::chrono::duration<double>(now_tick - prev_tick).count();
+        prev_tick = now_tick;
+        const double inst_fps = (loop_s > 1e-6) ? (1.0 / loop_s) : 0.0;
+        ema_fps = (frame_idx == 0) ? inst_fps : (0.85 * ema_fps + 0.15 * inst_fps);
+
+        size_t valid_count = 0;
+        for (const auto& t : metrics.targets) {
+            if (t.pose.valid) ++valid_count;
+        }
+        draw_hud(vis, frame_idx + 1, ema_fps, metrics, valid_count);
+        writer.write(vis);
+        ++frame_idx;
+
+        if (frame_idx == 1 || frame_idx % 30 == 0) {
+            std::printf("[Frame %d] fps=%.1f targets=%zu det=%.1fms m1=%.2fms (%s)\n",
+                        frame_idx, ema_fps, valid_count, metrics.det_ms, metrics.pose_ms,
+                        metrics.used_tracking ? "TRACK" : "COLD");
+            std::fflush(stdout);
+        }
+
+        if (args.show) {
+            cv::imshow("new_detect_test", vis);
+            const int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 'Q' || key == 27) {
+                break;
+            }
+        }
+    }
+
+    if (writer.isOpened()) {
+        writer.release();
+    }
+    mv_cam.close();
+    if (video_cap.isOpened()) {
+        video_cap.release();
+    }
+    if (args.show) {
+        cv::destroyAllWindows();
+    }
+
+    std::cout << "[Done] Recorded " << frame_idx << " frame(s)"
+              << (total_timeouts > 0 ? " (camera timeouts=" + std::to_string(total_timeouts) + ")" : "")
+              << (frame_idx > 0 ? (" -> " + out_path) : " (no frames captured; video file not created)")
+              << "\n";
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
+    try {
+        const Args args = parse_args(argc, argv);
+        std::cout << "[Init] OpenCV version: " << CV_VERSION
+                  << " | MVSDK: " << (tav_pose::MvCamera::sdk_available() ? "enabled" : "disabled")
+                  << "\n";
+
+        const auto bank = tav_pose::load_templates_csv(args.templates_path);
+        if (bank.empty()) {
+            std::cerr << "No templates loaded from " << args.templates_path << "\n";
+            return 1;
+        }
+
+        std::unique_ptr<tav_pose::YoloDetector> detector;
+        if (args.roi_str.empty()) {
+            std::vector<std::string> names;
+            names.reserve(bank.size());
+            for (const auto& t : bank) names.push_back(t.name);
+            detector = std::make_unique<tav_pose::YoloDetector>(
+                args.model_path, std::move(names), args.imgsz, args.conf, 0.45f, !args.use_bgr);
+        }
+
+        if (args.mode == InputMode::Image) {
+            return run_image_mode(args, detector.get(), bank);
+        }
+        return run_stream_mode(args, detector.get(), bank);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
