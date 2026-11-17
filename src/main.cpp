@@ -102,7 +102,7 @@ void print_usage() {
         << "  --out <path>         Output video (.avi/.mp4) or image (.png) path\n"
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
         << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
-        << "  --max-frames <N>     Stop automatically after N frames (default 0 = until q/ESC/Ctrl+C)\n"
+        << "  --max-frames <N>     Optional frame limit (default 0 = unlimited until Ctrl+C/q/ESC)\n"
         << "  --vis-gain <double>  Display brightness gain (<=0 = auto 3x on dark frames)\n"
         << "  --show               Display live OpenCV window (press q or ESC to stop)\n";
 }
@@ -362,13 +362,13 @@ FrameMetrics process_frame(const cv::Mat& frame,
 }
 
 void draw_hud(cv::Mat& vis,
-              int frame_idx,
+              long long frame_idx,
               double fps,
               const FrameMetrics& metrics,
               size_t valid_count) {
     char hud[192];
     std::snprintf(hud, sizeof(hud),
-                  "Frame %d | FPS %.1f | %s %.1fms | M1 %.2fms | targets %zu",
+                  "Frame %lld | FPS %.1f | %s %.1fms | M1 %.2fms | targets %zu",
                   frame_idx, fps, metrics.used_tracking ? "TRK" : "DET",
                   metrics.det_ms, metrics.pose_ms, valid_count);
     cv::putText(vis, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX,
@@ -569,21 +569,23 @@ int run_stream_mode(const Args& args,
 
     cv::VideoWriter writer;
     TrackState track_state;
-    int frame_idx = 0;
-    int total_timeouts = 0;
+    long long frame_idx = 0;
+    long long total_timeouts = 0;
     double ema_fps = 0.0;
     auto prev_tick = std::chrono::steady_clock::now();
 
     std::cout << "[Main] Stream started (mode="
               << (args.mode == InputMode::Camera ? "MindVision Camera" : "Video File")
               << ", track=" << (args.track ? "ON" : "OFF")
+              << ", max_frames="
+              << (args.max_frames > 0 ? std::to_string(args.max_frames) : std::string("unlimited"))
               << "). Press Ctrl+C"
               << (args.show ? " or q/ESC in preview window" : "")
               << " to stop and finalize video.\n";
 
     cv::Mat frame, gray, vis;
     while (!g_stop_requested) {
-        if (args.max_frames > 0 && frame_idx >= args.max_frames) break;
+        if (args.max_frames > 0 && frame_idx >= static_cast<long long>(args.max_frames)) break;
 
         bool got = false;
         if (args.mode == InputMode::Camera) {
@@ -633,7 +635,7 @@ int run_stream_mode(const Args& args,
         ++frame_idx;
 
         if (frame_idx == 1 || frame_idx % 30 == 0) {
-            std::printf("[Frame %d] fps=%.1f targets=%zu det=%.1fms m1=%.2fms (%s)\n",
+            std::printf("[Frame %lld] fps=%.1f targets=%zu det=%.1fms m1=%.2fms (%s)\n",
                         frame_idx, ema_fps, valid_count, metrics.det_ms, metrics.pose_ms,
                         metrics.used_tracking ? "TRACK" : "COLD");
             std::fflush(stdout);
