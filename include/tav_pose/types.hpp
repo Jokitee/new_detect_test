@@ -7,10 +7,15 @@
 namespace tav_pose {
 
 struct CameraIntrinsics {
-    double fx = 1400.0;
-    double fy = 1400.0;
-    double cx = 320.0;
-    double cy = 240.0;
+    double fx = 1757.35;
+    double fy = 1754.99;
+    double cx = 639.50;
+    double cy = 511.50;
+    double k1 = -0.0369;
+    double k2 = -0.2629;
+    double p1 = 0.00549;
+    double p2 = -0.00169;
+    double k3 = 1.609;
 };
 
 struct ModelPoint {

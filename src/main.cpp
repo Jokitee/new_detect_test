@@ -2,6 +2,7 @@
 #include "tav_pose/sparse_edge_pose.hpp"
 #include "tav_pose/yolo_detector.hpp"
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/core/utility.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -56,18 +57,14 @@ struct Args {
     bool no_show = false;
     bool force_show = false;
     int bench_runs = 0;
-    double fx = 1400.0;
+    double fx = -1.0;          // <= 0 -> calibrated 1757.35 on camera/1280x1024, else 1400.0
+    double fy = -1.0;          // <= 0 -> calibrated 1754.99 on camera/1280x1024, else fx
     double cx = -1.0;
     double cy = -1.0;
+    bool undistort = true;
 
     // Camera & video output options
-    int cam_idx = 0;
-    bool auto_exposure = false;
-    double exposure_us = 4000.0;  // 4 ms default exposure
-    int gain_r = 100;
-    int gain_g = 70;
-    int gain_b = 50;
-    int frame_speed = 0;          // 0=low (VM USB safe), 1=normal, 2=high
+    double exposure_us = 4000.0;  // 4 ms default exposure (only exposure differs from example1.cpp)
     double fps = 0.0;       // 0 -> auto (30.0 for camera, source FPS for video)
     int max_frames = 0;     // 0 -> unlimited
     bool track = false;
@@ -88,20 +85,18 @@ void print_usage() {
         << "  --imgsz <int>        YOLO input size (default 416)\n"
         << "  --conf <float>       YOLO confidence threshold (default 0.25)\n"
         << "  --bgr                Feed raw BGR instead of grayscale-BGR\n"
-        << "  --f <double>         Focal length px (default 1400.0)\n"
-        << "  --cx <double>        Principal point cx (default image width/2)\n"
-        << "  --cy <double>        Principal point cy (default image height/2)\n"
+        << "  --f <double>         Override focal length px (default calibrated 1757.35/1754.99 on camera)\n"
+        << "  --fy <double>        Override fy px\n"
+        << "  --cx <double>        Override principal point cx (default calibrated 639.50 on camera)\n"
+        << "  --cy <double>        Override principal point cy (default calibrated 511.50 on camera)\n"
+        << "  --no-undistort       Disable lens undistortion (default enabled for 1280x1024 camera)\n"
         << "  --roi x0,y0,x1,y1    Skip YOLO and use manual box\n"
         << "  --cls 3|4|7          Character class when using --roi (default 3)\n"
         << "  --track              Enable temporal Pure-M1 tracking between YOLO keyframes\n"
         << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
         << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"
-        << "MindVision Camera options:\n"
-        << "  --cam-idx <int>      Camera device index (default 0)\n"
-        << "  --ae                 Enable auto exposure (default off / manual)\n"
-        << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n"
-        << "  --gain r,g,b         ISP gain R,G,B (default 100,70,50)\n"
-        << "  --frame-speed <idx>  Camera frame speed index 0=low..2=high (default 0)\n\n"
+        << "MindVision Camera options (follows example1.cpp; only exposure configurable):\n"
+        << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n\n"
         << "Output options:\n"
         << "  --out <path>         Output video (.avi/.mp4) or image (.png) path\n"
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
@@ -110,21 +105,6 @@ void print_usage() {
         << "  --vis-gain <double>  Display brightness gain (<=0 = auto 3x on dark frames)\n"
         << "  --show               Display cv::imshow window (already enabled by default in camera/video mode)\n"
         << "  --no-show            Disable cv::imshow window (headless recording)\n";
-}
-
-void parse_gain(const std::string& s, int& r, int& g, int& b) {
-    std::stringstream ss(s);
-    std::string tok;
-    int vals[3]{};
-    for (int i = 0; i < 3; ++i) {
-        if (!std::getline(ss, tok, ',')) {
-            throw std::runtime_error("Invalid --gain format (expected r,g,b): " + s);
-        }
-        vals[i] = std::stoi(tok);
-    }
-    r = vals[0];
-    g = vals[1];
-    b = vals[2];
 }
 
 Args parse_args(int argc, char** argv) {
@@ -154,14 +134,12 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--imgsz") a.imgsz = std::stoi(next());
         else if (k == "--conf") a.conf = std::stof(next());
         else if (k == "--f") a.fx = std::stod(next());
+        else if (k == "--fy") a.fy = std::stod(next());
         else if (k == "--cx") a.cx = std::stod(next());
         else if (k == "--cy") a.cy = std::stod(next());
+        else if (k == "--no-undistort") a.undistort = false;
         else if (k == "--bench") a.bench_runs = std::stoi(next());
-        else if (k == "--cam-idx") a.cam_idx = std::stoi(next());
-        else if (k == "--ae") a.auto_exposure = true;
         else if (k == "--exposure") a.exposure_us = std::stod(next());
-        else if (k == "--gain") parse_gain(next(), a.gain_r, a.gain_g, a.gain_b);
-        else if (k == "--frame-speed") a.frame_speed = std::stoi(next());
         else if (k == "--fps") a.fps = std::stod(next());
         else if (k == "--max-frames") a.max_frames = std::max(0, std::stoi(next()));
         else if (k == "--track") a.track = true;
@@ -442,14 +420,51 @@ bool open_video_writer(cv::VideoWriter& writer,
     return false;
 }
 
-tav_pose::CameraIntrinsics build_intrinsics(const Args& args, const cv::Mat& gray) {
+tav_pose::CameraIntrinsics build_intrinsics(const Args& args, const cv::Size& frame_size) {
     tav_pose::CameraIntrinsics K;
-    K.fx = args.fx;
-    K.fy = args.fx;
-    K.cx = (args.cx >= 0.0) ? args.cx : gray.cols * 0.5;
-    K.cy = (args.cy >= 0.0) ? args.cy : gray.rows * 0.5;
+    const bool use_calibrated =
+        (args.fx <= 0.0) &&
+        (args.mode == InputMode::Camera || (frame_size.width == 1280 && frame_size.height == 1024));
+    if (use_calibrated) {
+        if (args.cx >= 0.0) K.cx = args.cx;
+        if (args.cy >= 0.0) K.cy = args.cy;
+        return K;
+    }
+    K.fx = (args.fx > 0.0) ? args.fx : 1400.0;
+    K.fy = (args.fy > 0.0) ? args.fy : K.fx;
+    K.cx = (args.cx >= 0.0) ? args.cx : frame_size.width * 0.5;
+    K.cy = (args.cy >= 0.0) ? args.cy : frame_size.height * 0.5;
+    K.k1 = K.k2 = K.p1 = K.p2 = K.k3 = 0.0;
     return K;
 }
+
+class Undistorter {
+public:
+    void apply(const cv::Mat& src,
+               cv::Mat& dst,
+               const tav_pose::CameraIntrinsics& K,
+               bool enabled) {
+        if (!enabled || (K.k1 == 0.0 && K.k2 == 0.0 && K.p1 == 0.0 && K.p2 == 0.0 && K.k3 == 0.0)) {
+            dst = src;
+            return;
+        }
+        if (cached_size_ != src.size()) {
+            const cv::Mat K_mat = (cv::Mat_<double>(3, 3) << K.fx, 0.0, K.cx,
+                                   0.0, K.fy, K.cy,
+                                   0.0, 0.0, 1.0);
+            const cv::Mat dist = (cv::Mat_<double>(1, 5) << K.k1, K.k2, K.p1, K.p2, K.k3);
+            cv::initUndistortRectifyMap(
+                K_mat, dist, cv::Mat(), K_mat, src.size(), CV_16SC2, map1_, map2_);
+            cached_size_ = src.size();
+        }
+        cv::remap(src, dst, map1_, map2_, cv::INTER_LINEAR);
+    }
+
+private:
+    cv::Size cached_size_;
+    cv::Mat map1_;
+    cv::Mat map2_;
+};
 
 int run_image_mode(const Args& args,
                    const tav_pose::YoloDetector* detector,
@@ -468,16 +483,20 @@ int run_image_mode(const Args& args,
         return 1;
     }
 
+    const auto K = build_intrinsics(args, bgr.size());
+    cv::Mat work_bgr;
+    Undistorter undistorter;
+    undistorter.apply(bgr, work_bgr, K, args.undistort && (bgr.cols == 1280 && bgr.rows == 1024));
+
     cv::Mat gray;
-    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-    const auto K = build_intrinsics(args, gray);
+    cv::cvtColor(work_bgr, gray, cv::COLOR_BGR2GRAY);
 
     if (args.bench_runs > 0 && detector) {
-        detector->detect(bgr);
+        detector->detect(work_bgr);
     }
 
     cv::Mat vis;
-    const FrameMetrics metrics = process_frame(bgr, gray, detector, bank, K, args, nullptr, vis);
+    const FrameMetrics metrics = process_frame(work_bgr, gray, detector, bank, K, args, nullptr, vis);
 
     std::printf("Image: %s (%dx%d), f=%.1f px, detections=%zu, det_time=%.2f ms\n",
                 args.image_path.c_str(), gray.cols, gray.rows, K.fx,
@@ -547,15 +566,7 @@ int run_stream_mode(const Args& args,
     double target_fps = args.fps;
 
     if (args.mode == InputMode::Camera) {
-        tav_pose::MvCameraConfig cam_cfg;
-        cam_cfg.camera_index = args.cam_idx;
-        cam_cfg.auto_exposure = args.auto_exposure;
-        cam_cfg.exposure_us = args.exposure_us;
-        cam_cfg.gain_r = args.gain_r;
-        cam_cfg.gain_g = args.gain_g;
-        cam_cfg.gain_b = args.gain_b;
-        cam_cfg.frame_speed = args.frame_speed;
-        mv_cam.open(cam_cfg);
+        mv_cam.open(args.exposure_us);
         if (target_fps <= 0.0) target_fps = 30.0;
     } else {
         if (!video_cap.open(args.video_path)) {
@@ -595,29 +606,34 @@ int run_stream_mode(const Args& args,
               << (show_window ? " or q/ESC in preview window" : "")
               << " to stop and finalize video." << std::endl;
 
-    cv::Mat frame, gray, vis;
+    cv::Mat raw_frame, frame, gray, vis;
+    Undistorter undistorter;
     while (!g_stop_requested) {
         if (args.max_frames > 0 && frame_idx >= static_cast<long long>(args.max_frames)) break;
 
         bool got = false;
         if (args.mode == InputMode::Camera) {
-            got = mv_cam.grab(frame);
+            got = mv_cam.grab(raw_frame);
             if (!got) {
                 ++total_timeouts;
-                if (show_window) {
-                    const int key = cv::waitKey(5) & 0xFF;
-                    if (key == 'q' || key == 'Q' || key == 27) break;
-                }
                 continue;
             }
         } else {
-            got = video_cap.read(frame);
-            if (!got || frame.empty()) break;
+            got = video_cap.read(raw_frame);
+            if (!got || raw_frame.empty()) break;
         }
+
+        const auto K = build_intrinsics(args, raw_frame.size());
+        const bool do_undist = args.undistort &&
+                               (args.mode == InputMode::Camera ||
+                                (raw_frame.cols == 1280 && raw_frame.rows == 1024));
+        undistorter.apply(raw_frame, frame, K, do_undist);
 
         if (frame_idx == 0) {
             std::cout << "[Main] First frame captured: " << frame.cols << "x" << frame.rows
-                      << " channels=" << frame.channels() << std::endl;
+                      << " ch=" << frame.channels()
+                      << " K=(" << K.fx << "," << K.fy << "," << K.cx << "," << K.cy << ")"
+                      << (do_undist ? " [undistort ON]" : "") << std::endl;
         }
 
         if (frame.channels() == 1) {
@@ -633,7 +649,6 @@ int run_stream_mode(const Args& args,
             }
         }
 
-        const auto K = build_intrinsics(args, gray);
         const FrameMetrics metrics = process_frame(
             frame, gray, detector, bank, K, args, args.track ? &track_state : nullptr, vis);
 
