@@ -156,37 +156,72 @@ double pca_roll_deg(const std::vector<cv::Point2d>& pts) {
 }
 
 bool solve_6x6(const cv::Matx66d& H, const cv::Vec6d& g, cv::Vec6d& dx) {
-    cv::Mat Hm(H), gm(-g), xm;
-    if (!cv::solve(Hm, gm, xm, cv::DECOMP_CHOLESKY) &&
-        !cv::solve(Hm, gm, xm, cv::DECOMP_LU)) {
-        return false;
+    // Zero-allocation Gaussian elimination with partial pivoting for H * dx = -g.
+    double A[6][7];
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) A[r][c] = H(r, c);
+        A[r][6] = -g[r];
     }
-    for (int i = 0; i < 6; ++i) dx[i] = xm.at<double>(i);
+    for (int col = 0; col < 6; ++col) {
+        int piv = col;
+        double best = std::abs(A[col][col]);
+        for (int r = col + 1; r < 6; ++r) {
+            const double v = std::abs(A[r][col]);
+            if (v > best) {
+                best = v;
+                piv = r;
+            }
+        }
+        if (!(best > 1e-18)) return false;
+        if (piv != col) {
+            for (int c = col; c < 7; ++c) std::swap(A[col][c], A[piv][c]);
+        }
+        const double inv_piv = 1.0 / A[col][col];
+        for (int r = col + 1; r < 6; ++r) {
+            const double f = A[r][col] * inv_piv;
+            if (f == 0.0) continue;
+            for (int c = col + 1; c < 7; ++c) {
+                A[r][c] -= f * A[col][c];
+            }
+        }
+    }
+    for (int r = 5; r >= 0; --r) {
+        double sum = A[r][6];
+        for (int c = r + 1; c < 6; ++c) {
+            sum -= A[r][c] * dx[c];
+        }
+        dx[r] = sum / A[r][r];
+        if (!std::isfinite(dx[r])) return false;
+    }
     return true;
 }
 
-struct EdgeSearchResult {
+struct EdgeSearchScratch {
+    std::vector<float> v;
+    std::vector<float> dmins;
+    std::vector<float> neg_dmins;
+    std::vector<float> all_d;
     std::vector<double> off;
     std::vector<uint8_t> valid;
     int n_valid = 0;
 };
 
-EdgeSearchResult edge_search(const cv::Mat& gs,
-                             const std::vector<cv::Point2d>& pts_img,
-                             const std::vector<cv::Point2d>& n_img,
-                             int rad) {
+void edge_search(const cv::Mat& gs,
+                 const std::vector<cv::Point2d>& pts_img,
+                 const std::vector<cv::Point2d>& n_img,
+                 int rad,
+                 EdgeSearchScratch& sc) {
     const int n_pts = static_cast<int>(pts_img.size());
     const int len = 2 * rad + 1;
     const int dlen = len - 2;
 
-    EdgeSearchResult out;
-    out.off.assign(n_pts, 0.0);
-    out.valid.assign(n_pts, 0);
-
-    std::vector<float> v(len);
-    std::vector<float> d(dlen);
-    std::vector<float> dmins(n_pts, 0.0f);
-    std::vector<std::vector<float>> all_d(n_pts, std::vector<float>(dlen));
+    sc.off.assign(n_pts, 0.0);
+    sc.valid.assign(n_pts, 0);
+    sc.n_valid = 0;
+    sc.v.resize(len);
+    sc.dmins.resize(n_pts);
+    sc.neg_dmins.resize(n_pts);
+    sc.all_d.resize(static_cast<size_t>(n_pts) * static_cast<size_t>(dlen));
 
     for (int i = 0; i < n_pts; ++i) {
         const float px = static_cast<float>(pts_img[i].x);
@@ -195,29 +230,29 @@ EdgeSearchResult edge_search(const cv::Mat& gs,
         const float ny = static_cast<float>(n_img[i].y);
         for (int k = 0; k < len; ++k) {
             const float o = static_cast<float>(k - rad);
-            v[k] = sample_bilinear_f32(gs, px + o * nx, py + o * ny);
+            sc.v[k] = sample_bilinear_f32(gs, px + o * nx, py + o * ny);
         }
+        float* di = sc.all_d.data() + static_cast<size_t>(i) * static_cast<size_t>(dlen);
         float dmin = std::numeric_limits<float>::infinity();
         for (int k = 0; k < dlen; ++k) {
-            const float dv = 0.5f * (v[k + 2] - v[k]);
-            all_d[i][k] = dv;
+            const float dv = 0.5f * (sc.v[k + 2] - sc.v[k]);
+            di[k] = dv;
             if (dv < dmin) dmin = dv;
         }
-        dmins[i] = dmin;
+        sc.dmins[i] = dmin;
+        sc.neg_dmins[i] = -dmin;
     }
 
-    std::vector<float> neg_dmins(n_pts);
-    for (int i = 0; i < n_pts; ++i) neg_dmins[i] = -dmins[i];
-    std::nth_element(neg_dmins.begin(), neg_dmins.begin() + n_pts / 2, neg_dmins.end());
-    const float contrast = neg_dmins[n_pts / 2];
+    std::nth_element(sc.neg_dmins.begin(), sc.neg_dmins.begin() + n_pts / 2, sc.neg_dmins.end());
+    const float contrast = sc.neg_dmins[n_pts / 2];
     const float thr = -std::max(0.35f * contrast, 0.8f);
 
     for (int i = 0; i < n_pts; ++i) {
-        if (!(dmins[i] < thr)) continue;
-        const auto& di = all_d[i];
+        if (!(sc.dmins[i] < thr)) continue;
+        const float* di = sc.all_d.data() + static_cast<size_t>(i) * static_cast<size_t>(dlen);
         int best_j = -1;
         float best_abs_o = std::numeric_limits<float>::infinity();
-        const float half_min = 0.5f * dmins[i];
+        const float half_min = 0.5f * sc.dmins[i];
         for (int j = 1; j < dlen - 1; ++j) {
             if (di[j] <= di[j - 1] && di[j] <= di[j + 1] && di[j] < half_min) {
                 const float o = static_cast<float>(j - (rad - 1));
@@ -238,11 +273,10 @@ EdgeSearchResult edge_search(const cv::Mat& gs,
             sub = std::clamp(0.5f * (dm - dp) / den, -0.5f, 0.5f);
         }
         const double o_j = static_cast<double>(best_j - (rad - 1));
-        out.off[i] = o_j + sub;
-        out.valid[i] = 1;
-        out.n_valid++;
+        sc.off[i] = o_j + sub;
+        sc.valid[i] = 1;
+        sc.n_valid++;
     }
-    return out;
 }
 
 void project_with_lie_jac(const CharTemplate& tpl,
@@ -401,15 +435,17 @@ void refine_edges_lie(const cv::Mat& gs,
     const int min_valid = std::min(12, std::max(6, static_cast<int>(tpl.points.size()) / 2));
     std::vector<cv::Point2d> uv, n_img;
     std::vector<cv::Matx<double, 2, 6>> J;
+    EdgeSearchScratch es;
+    std::vector<double> abs_e;
 
     for (int rad : radii) {
         project_with_lie_jac(tpl, R, t, K, uv, n_img, J);
-        EdgeSearchResult es = edge_search(gs, uv, n_img, rad);
+        edge_search(gs, uv, n_img, rad, es);
         if (es.n_valid < min_valid) break;
 
         cv::Matx66d H = cv::Matx66d::zeros();
         cv::Vec6d g = cv::Vec6d::zeros();
-        std::vector<double> abs_e;
+        abs_e.clear();
         abs_e.reserve(es.n_valid);
 
         for (size_t i = 0; i < tpl.points.size(); ++i) {
@@ -792,7 +828,10 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     } else {
         radii = {6, 4, 3, 2};
     }
-    for (const auto& cand : cands) {
+    bool high_conf_lock = false;
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        if (ci >= 4 && high_conf_lock) break;
+        const auto& cand = cands[ci];
         cv::Matx33d R = cand.R;
         cv::Vec3d t = t0;
         refine_chamfer_gated(dt, dtx, dty, R, t, tpl, Kc, 8, chamfer_gate, 3.0);
@@ -803,6 +842,9 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
         if (!std::isfinite(phot)) continue;
         const double sc = phot * (frac * frac) - 2.0 * std::max(med - 0.5, 0.0);
         refined.push_back({R, t, sc, phot, med, frac});
+        if (frac >= 0.80 && med <= 0.45 && phot > 8.0) {
+            high_conf_lock = true;
+        }
     }
     if (refined.empty()) return res;
 

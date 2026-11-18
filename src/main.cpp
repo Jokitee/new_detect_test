@@ -10,6 +10,7 @@
 #include <opencv2/videoio.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -107,6 +108,7 @@ struct Args {
     int max_frames = 0;     // 0 -> unlimited
     bool track = false;
     int redetect_every = 15;
+    int max_targets = 0;    // <= 0 -> solve all detections (in parallel); > 0 -> cap top-K
     double vis_gain = 0.0;  // <= 0 -> auto brightness boost on dark frames
     int threads = 0;        // > 0 -> cv::setNumThreads(threads)
 };
@@ -135,6 +137,7 @@ void print_usage() {
         << "  --cls 1|3|sentary    Target class when using --roi (default 1)\n"
         << "  --track              Enable temporal Pure-M1 tracking between YOLO keyframes\n"
         << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
+        << "  --max-targets <N>    Max targets to solve per frame (default 0 = all, sorted by conf)\n"
         << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"
         << "MindVision Camera options (follows example1.cpp; 640x480 hardware -> 448x336 downsample + 4ms exposure):\n"
         << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n"
@@ -198,6 +201,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--max-frames") a.max_frames = std::max(0, std::stoi(next()));
         else if (k == "--track") a.track = true;
         else if (k == "--redetect-every") a.redetect_every = std::max(1, std::stoi(next()));
+        else if (k == "--max-targets") a.max_targets = std::max(0, std::stoi(next()));
         else if (k == "--vis-gain") a.vis_gain = std::stod(next());
         else if (k == "--threads") a.threads = std::max(1, std::stoi(next()));
         else if (k == "--bgr") a.use_bgr = true;
@@ -279,28 +283,46 @@ bool try_temporal_tracking(const cv::Mat& gray,
         return false;
     }
 
-    std::vector<PoseTarget> updated;
-    updated.reserve(track.items.size());
-    double pose_ms_sum = 0.0;
+    const size_t n_trk = track.items.size();
+    std::vector<PoseTarget> updated(n_trk);
+    std::atomic<bool> any_lost{false};
+    const auto tm0 = std::chrono::steady_clock::now();
 
-    for (const auto& prev : track.items) {
-        if (!prev.tpl) return false;
+    auto solve_one_trk = [&](size_t i) {
+        const auto& prev = track.items[i];
+        if (!prev.tpl) {
+            any_lost.store(true);
+            return;
+        }
         const auto pose = tav_pose::SparseEdgePoseSolver::solve_tracking(
             gray, prev.pose.rvec, prev.pose.tvec, *prev.tpl, K);
-        pose_ms_sum += pose.solve_ms;
         if (!pose.valid || pose.edge_frac < 0.55 || pose.edge_med_px > 3.5) {
-            return false;
+            any_lost.store(true);
+            return;
         }
         const auto pts = tav_pose::SparseEdgePoseSolver::project_points(
             *prev.tpl, pose.rvec, pose.tvec, K);
         PoseTarget cur = prev;
         cur.pose = pose;
         cur.det.box = projected_bbox(pts, gray.cols, gray.rows);
-        updated.push_back(std::move(cur));
+        updated[i] = std::move(cur);
+    };
+
+    if (n_trk > 1) {
+        cv::parallel_for_(cv::Range(0, static_cast<int>(n_trk)), [&](const cv::Range& range) {
+            for (int i = range.start; i < range.end; ++i) {
+                solve_one_trk(static_cast<size_t>(i));
+            }
+        });
+    } else {
+        solve_one_trk(0);
     }
 
+    if (any_lost.load()) return false;
+
+    const auto tm1 = std::chrono::steady_clock::now();
     metrics.det_ms = 0.0;
-    metrics.pose_ms = pose_ms_sum;
+    metrics.pose_ms = std::chrono::duration<double, std::milli>(tm1 - tm0).count();
     metrics.used_tracking = true;
     metrics.targets = updated;
     track.items = std::move(updated);
@@ -344,20 +366,44 @@ FrameMetrics process_frame(const cv::Mat& frame,
             }
         }
 
-        if (trace_frame0 && !dets.empty()) {
-            std::cout << "[Trace] Frame 0 running M1 on " << dets.size() << " det(s)..." << std::endl;
-        }
+        std::vector<const tav_pose::CharTemplate*> tpls;
+        std::vector<tav_pose::Detection> solve_dets;
         for (const auto& d : dets) {
             const auto* tpl = find_template(bank, d.cls_name, d.cls_id);
             if (!tpl) continue;
-            PoseTarget item;
-            item.det = d;
-            item.tpl = tpl;
-            item.pose = tav_pose::SparseEdgePoseSolver::solve_cold_start(gray, d.box, *tpl, K);
-            if (item.pose.valid) {
-                metrics.pose_ms += item.pose.solve_ms;
+            solve_dets.push_back(d);
+            tpls.push_back(tpl);
+            if (args.max_targets > 0 && static_cast<int>(solve_dets.size()) >= args.max_targets) {
+                break;
             }
-            metrics.targets.push_back(std::move(item));
+        }
+
+        const size_t n_solve = solve_dets.size();
+        if (trace_frame0 && n_solve > 0) {
+            std::cout << "[Trace] Frame 0 running M1 on " << n_solve << " det(s)..." << std::endl;
+        }
+        if (n_solve > 0) {
+            metrics.targets.resize(n_solve);
+            const auto tm0 = std::chrono::steady_clock::now();
+            auto solve_one = [&](size_t i) {
+                PoseTarget item;
+                item.det = solve_dets[i];
+                item.tpl = tpls[i];
+                item.pose = tav_pose::SparseEdgePoseSolver::solve_cold_start(
+                    gray, solve_dets[i].box, *tpls[i], K);
+                metrics.targets[i] = std::move(item);
+            };
+            if (n_solve > 1) {
+                cv::parallel_for_(cv::Range(0, static_cast<int>(n_solve)), [&](const cv::Range& range) {
+                    for (int i = range.start; i < range.end; ++i) {
+                        solve_one(static_cast<size_t>(i));
+                    }
+                });
+            } else {
+                solve_one(0);
+            }
+            const auto tm1 = std::chrono::steady_clock::now();
+            metrics.pose_ms = std::chrono::duration<double, std::milli>(tm1 - tm0).count();
         }
         if (trace_frame0) {
             std::cout << "[Trace] Frame 0 M1 OK (" << metrics.pose_ms << "ms)" << std::endl;
