@@ -2,157 +2,6 @@
 -- (11-state EKF, Target, Solver, Aimer, Shooter, TinyMPC Planner) with TAV IFL-Net V2-Slim + Pure-M1.
 -- Works both standalone (`cd sp_aim && xmake`) and as an optional target under `new_detect_test` (`xmake build sp_ekf_test`).
 
-local function configure_opencv(target)
-    if has_config("use_xrepo") then
-        return
-    end
-    local function try_prefix(prefix)
-        if not prefix or #prefix == 0 or not os.isdir(prefix) then
-            return false
-        end
-        local incdir = nil
-        for _, cand_inc in ipairs({
-            path.join(prefix, "include", "opencv4"),
-            path.join(prefix, "include")
-        }) do
-            if os.isfile(path.join(cand_inc, "opencv2", "opencv.hpp")) then
-                incdir = cand_inc
-                break
-            end
-        end
-        if not incdir then
-            return false
-        end
-
-        local mod_order = {
-            "opencv_dnn", "opencv_calib3d", "opencv_highgui", "opencv_videoio",
-            "opencv_imgcodecs", "opencv_features2d", "opencv_flann",
-            "opencv_imgproc", "opencv_core"
-        }
-        local libdir = nil
-        local links = {}
-        for _, cand_lib in ipairs({
-            path.join(prefix, "lib"),
-            path.join(prefix, "lib64"),
-            path.join(prefix, "lib", "x86_64-linux-gnu"),
-            path.join(prefix, "lib", "aarch64-linux-gnu")
-        }) do
-            if os.isdir(cand_lib) then
-                if os.isfile(path.join(cand_lib, "libopencv_world.so")) then
-                    libdir = cand_lib
-                    links = {"opencv_world"}
-                    break
-                end
-                local found = {}
-                for _, m in ipairs(mod_order) do
-                    if os.isfile(path.join(cand_lib, "lib" .. m .. ".so")) then
-                        table.insert(found, m)
-                    end
-                end
-                if #found > 0 then
-                    libdir = cand_lib
-                    links = found
-                    break
-                end
-            end
-        end
-        if not libdir then
-            return false
-        end
-
-        target:add("includedirs", incdir)
-        target:add("linkdirs", libdir)
-        target:add("rpathdirs", libdir)
-        target:add("links", links)
-        return true
-    end
-
-    local candidates = {}
-    local home = os.getenv("HOME") or ""
-    local user_dir = get_config("opencv_dir")
-    if user_dir and #user_dir > 0 then
-        if #home > 0 and user_dir:sub(1, 2) == "~/" then
-            user_dir = path.join(home, user_dir:sub(3))
-        end
-        table.insert(candidates, user_dir)
-    end
-    for _, env_name in ipairs({"OpenCV_DIR", "OPENCV_DIR"}) do
-        local ev = os.getenv(env_name)
-        if ev and #ev > 0 then
-            table.insert(candidates, ev)
-            local p2 = path.directory(path.directory(ev))
-            table.insert(candidates, p2)
-            table.insert(candidates, path.directory(p2))
-        end
-    end
-    if #home > 0 then
-        table.insert(candidates, path.join(home, "install"))
-        table.insert(candidates, path.join(home, "install", "opencv4"))
-        table.insert(candidates, path.join(home, "install", "opencv-4.13.0"))
-        table.insert(candidates, path.join(home, "opencv", "install"))
-        table.insert(candidates, path.join(home, "opencv-4.13.0", "install"))
-    end
-    table.insert(candidates, "/usr/local")
-    table.insert(candidates, "/usr")
-
-    for _, p in ipairs(candidates) do
-        if try_prefix(p) then
-            return
-        end
-    end
-
-    import("lib.detect.find_package")
-    for _, name in ipairs({"pkgconfig::opencv4", "pkgconfig::opencv", "cmake::OpenCV"}) do
-        local pkg = find_package(name)
-        if pkg then
-            if pkg.includedirs then target:add("includedirs", pkg.includedirs) end
-            if pkg.sysincludedirs then target:add("includedirs", pkg.sysincludedirs) end
-            if pkg.linkdirs then
-                target:add("linkdirs", pkg.linkdirs)
-                target:add("rpathdirs", pkg.linkdirs)
-            end
-            if pkg.links then target:add("links", pkg.links) end
-            return
-        end
-    end
-    raise("OpenCV not found for sp_ekf_test.")
-end
-
-local function configure_sp_deps(target)
-    import("lib.detect.find_package")
-    local function try_pkg(names, fallback_incs, fallback_links)
-        for _, n in ipairs(names) do
-            local pkg = find_package(n)
-            if pkg then
-                if pkg.includedirs then target:add("includedirs", pkg.includedirs) end
-                if pkg.sysincludedirs then target:add("includedirs", pkg.sysincludedirs) end
-                if pkg.defines then target:add("defines", pkg.defines) end
-                if pkg.linkdirs then target:add("linkdirs", pkg.linkdirs) end
-                if pkg.links then target:add("links", pkg.links) end
-                return true
-            end
-        end
-        for _, inc in ipairs(fallback_incs or {}) do
-            if os.isdir(inc) then
-                target:add("includedirs", inc)
-            end
-        end
-        for _, l in ipairs(fallback_links or {}) do
-            target:add("links", l)
-        end
-        return false
-    end
-
-    try_pkg({"pkgconfig::eigen3", "cmake::Eigen3"}, {"/usr/include/eigen3", "/usr/local/include/eigen3"}, {})
-    try_pkg({"pkgconfig::yaml-cpp", "cmake::yaml-cpp"}, {}, {"yaml-cpp"})
-    try_pkg({"pkgconfig::fmt", "cmake::fmt"}, {}, {"fmt"})
-    if not try_pkg({"pkgconfig::spdlog", "cmake::spdlog"}, {}, {"spdlog"}) then
-        -- Ubuntu apt libspdlog-dev defaults to compiled lib against external fmt
-        target:add("defines", "SPDLOG_FMT_EXTERNAL", "SPDLOG_COMPILED_LIB")
-    end
-    try_pkg({"pkgconfig::nlohmann_json", "cmake::nlohmann_json"}, {}, {})
-end
-
 local sp_dir = os.scriptdir()
 local root_dir = path.directory(sp_dir)
 local is_standalone = (os.projectdir() == sp_dir)
@@ -232,11 +81,157 @@ target("sp_ekf_test")
     if has_config("use_xrepo") then
         add_packages("opencv")
     end
+
     on_load(function (target)
-        if not has_config("use_xrepo") then
-            configure_opencv(target)
+        import("lib.detect.find_package")
+
+        local function configure_opencv()
+            local function try_prefix(prefix)
+                if not prefix or #prefix == 0 or not os.isdir(prefix) then
+                    return false
+                end
+                local incdir = nil
+                for _, cand_inc in ipairs({
+                    path.join(prefix, "include", "opencv4"),
+                    path.join(prefix, "include")
+                }) do
+                    if os.isfile(path.join(cand_inc, "opencv2", "opencv.hpp")) then
+                        incdir = cand_inc
+                        break
+                    end
+                end
+                if not incdir then
+                    return false
+                end
+
+                local mod_order = {
+                    "opencv_dnn", "opencv_calib3d", "opencv_highgui", "opencv_videoio",
+                    "opencv_imgcodecs", "opencv_features2d", "opencv_flann",
+                    "opencv_imgproc", "opencv_core"
+                }
+                local libdir = nil
+                local links = {}
+                for _, cand_lib in ipairs({
+                    path.join(prefix, "lib"),
+                    path.join(prefix, "lib64"),
+                    path.join(prefix, "lib", "x86_64-linux-gnu"),
+                    path.join(prefix, "lib", "aarch64-linux-gnu")
+                }) do
+                    if os.isdir(cand_lib) then
+                        if os.isfile(path.join(cand_lib, "libopencv_world.so")) then
+                            libdir = cand_lib
+                            links = {"opencv_world"}
+                            break
+                        end
+                        local found = {}
+                        for _, m in ipairs(mod_order) do
+                            if os.isfile(path.join(cand_lib, "lib" .. m .. ".so")) then
+                                table.insert(found, m)
+                            end
+                        end
+                        if #found > 0 then
+                            libdir = cand_lib
+                            links = found
+                            break
+                        end
+                    end
+                end
+                if not libdir then
+                    return false
+                end
+
+                target:add("includedirs", incdir)
+                target:add("linkdirs", libdir)
+                target:add("rpathdirs", libdir)
+                target:add("links", links)
+                return true
+            end
+
+            local candidates = {}
+            local home = os.getenv("HOME") or ""
+            local user_dir = get_config("opencv_dir")
+            if user_dir and #user_dir > 0 then
+                if #home > 0 and user_dir:sub(1, 2) == "~/" then
+                    user_dir = path.join(home, user_dir:sub(3))
+                end
+                table.insert(candidates, user_dir)
+            end
+            for _, env_name in ipairs({"OpenCV_DIR", "OPENCV_DIR"}) do
+                local ev = os.getenv(env_name)
+                if ev and #ev > 0 then
+                    table.insert(candidates, ev)
+                    local p2 = path.directory(path.directory(ev))
+                    table.insert(candidates, p2)
+                    table.insert(candidates, path.directory(p2))
+                end
+            end
+            if #home > 0 then
+                table.insert(candidates, path.join(home, "install"))
+                table.insert(candidates, path.join(home, "install", "opencv4"))
+                table.insert(candidates, path.join(home, "install", "opencv-4.13.0"))
+                table.insert(candidates, path.join(home, "opencv", "install"))
+                table.insert(candidates, path.join(home, "opencv-4.13.0", "install"))
+            end
+            table.insert(candidates, "/usr/local")
+            table.insert(candidates, "/usr")
+
+            for _, p in ipairs(candidates) do
+                if try_prefix(p) then
+                    return
+                end
+            end
+
+            for _, name in ipairs({"pkgconfig::opencv4", "pkgconfig::opencv", "cmake::OpenCV"}) do
+                local pkg = find_package(name)
+                if pkg then
+                    if pkg.includedirs then target:add("includedirs", pkg.includedirs) end
+                    if pkg.sysincludedirs then target:add("includedirs", pkg.sysincludedirs) end
+                    if pkg.linkdirs then
+                        target:add("linkdirs", pkg.linkdirs)
+                        target:add("rpathdirs", pkg.linkdirs)
+                    end
+                    if pkg.links then target:add("links", pkg.links) end
+                    return
+                end
+            end
+            raise("OpenCV not found for sp_ekf_test.")
         end
-        configure_sp_deps(target)
+
+        local function try_pkg(names, fallback_incs, fallback_links)
+            for _, n in ipairs(names) do
+                local pkg = find_package(n)
+                if pkg then
+                    if pkg.includedirs then target:add("includedirs", pkg.includedirs) end
+                    if pkg.sysincludedirs then target:add("includedirs", pkg.sysincludedirs) end
+                    if pkg.defines then target:add("defines", pkg.defines) end
+                    if pkg.cxflags then target:add("cxflags", pkg.cxflags) end
+                    if pkg.cxxflags then target:add("cxxflags", pkg.cxxflags) end
+                    if pkg.linkdirs then target:add("linkdirs", pkg.linkdirs) end
+                    if pkg.links then target:add("links", pkg.links) end
+                    return true
+                end
+            end
+            for _, inc in ipairs(fallback_incs or {}) do
+                if os.isdir(inc) then
+                    target:add("includedirs", inc)
+                end
+            end
+            for _, l in ipairs(fallback_links or {}) do
+                target:add("links", l)
+            end
+            return false
+        end
+
+        if not has_config("use_xrepo") then
+            configure_opencv()
+        end
+        try_pkg({"pkgconfig::eigen3", "cmake::Eigen3"}, {"/usr/include/eigen3", "/usr/local/include/eigen3"}, {})
+        try_pkg({"pkgconfig::yaml-cpp", "cmake::yaml-cpp"}, {}, {"yaml-cpp"})
+        try_pkg({"pkgconfig::fmt", "cmake::fmt"}, {}, {"fmt"})
+        if not try_pkg({"pkgconfig::spdlog", "cmake::spdlog"}, {}, {"spdlog"}) then
+            target:add("defines", "SPDLOG_FMT_EXTERNAL", "SPDLOG_COMPILED_LIB")
+        end
+        try_pkg({"pkgconfig::nlohmann_json", "cmake::nlohmann_json"}, {}, {})
     end)
 
     if has_config("with_mvsdk") then
