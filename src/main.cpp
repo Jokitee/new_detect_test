@@ -45,14 +45,16 @@ struct Args {
     InputMode mode = InputMode::Camera;
     std::string image_path;
     std::string video_path;
-    std::string model_path = "assets/char3_det_416.onnx";
+    std::string model_path = "assets/ifl_net_v2_448x336.onnx";
     std::string templates_path = "assets/templates.csv";
     std::string out_path;
     std::string roi_str;
     std::string cls_name = "3";
     std::string codec;
-    int imgsz = 416;
-    float conf = 0.25f;
+    int imgsz = -1;
+    int det_w = -1;
+    int det_h = -1;
+    float conf = 0.28f;
     bool use_bgr = false;
     bool no_show = false;
     bool force_show = false;
@@ -67,6 +69,9 @@ struct Args {
     double exposure_us = 4000.0;  // 4 ms default exposure (only exposure differs from example1.cpp)
     int cam_width = 640;
     int cam_height = 480;
+    bool downsample = true;       // 640x480 -> 448x336 (0.7x INTER_AREA, no crop)
+    int stream_w = 448;
+    int stream_h = 336;
     double fps = 0.0;       // 0 -> auto (30.0 for camera, source FPS for video)
     int max_frames = 0;     // 0 -> unlimited
     bool track = false;
@@ -82,10 +87,12 @@ void print_usage() {
         << "  --video <path>       Offline video file -> OpenCV VideoWriter output\n"
         << "  --image <path>       Single image inference -> PNG output\n\n"
         << "Detection & Pure-M1 Pose options:\n"
-        << "  --model <onnx>       YOLOv8n ONNX path (default assets/char3_det_416.onnx)\n"
+        << "  --model <onnx>       ONNX path (default assets/ifl_net_v2_448x336.onnx)\n"
         << "  --templates <csv>    3D sparse contour CSV (default assets/templates.csv)\n"
-        << "  --imgsz <int>        YOLO input size (default 416)\n"
-        << "  --conf <float>       YOLO confidence threshold (default 0.25)\n"
+        << "  --imgsz <int>        Square detector input size override (e.g. 416 for YOLOv8n)\n"
+        << "  --det-w <int>        Detector input width (default 448, or 416 if YOLOv8 416)\n"
+        << "  --det-h <int>        Detector input height (default 336, or 416 if YOLOv8 416)\n"
+        << "  --conf <float>       Detector confidence threshold (default 0.28)\n"
         << "  --bgr                Feed raw BGR instead of grayscale-BGR\n"
         << "  --f <double>         Override focal length px (default calibrated 1757.35/1754.99 on camera)\n"
         << "  --fy <double>        Override fy px\n"
@@ -97,10 +104,13 @@ void print_usage() {
         << "  --track              Enable temporal Pure-M1 tracking between YOLO keyframes\n"
         << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
         << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"
-        << "MindVision Camera options (follows example1.cpp; 640x480 hardware resolution + 4ms exposure):\n"
+        << "MindVision Camera options (follows example1.cpp; 640x480 hardware -> 448x336 downsample + 4ms exposure):\n"
         << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n"
         << "  --cam-w <int>        Hardware resolution width (default 640)\n"
-        << "  --cam-h <int>        Hardware resolution height (default 480)\n\n"
+        << "  --cam-h <int>        Hardware resolution height (default 480)\n"
+        << "  --stream-w <int>     Downsampled working width without crop (default 448)\n"
+        << "  --stream-h <int>     Downsampled working height without crop (default 336)\n"
+        << "  --no-downsample      Keep raw capture resolution (640x480) instead of downsampling to 448x336\n\n"
         << "Output options:\n"
         << "  --out <path>         Output video (.avi/.mp4) or image (.png) path\n"
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
@@ -136,6 +146,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--cls") a.cls_name = next();
         else if (k == "--codec") a.codec = next();
         else if (k == "--imgsz") a.imgsz = std::stoi(next());
+        else if (k == "--det-w") a.det_w = std::stoi(next());
+        else if (k == "--det-h") a.det_h = std::stoi(next());
         else if (k == "--conf") a.conf = std::stof(next());
         else if (k == "--f") a.fx = std::stod(next());
         else if (k == "--fy") a.fy = std::stod(next());
@@ -146,6 +158,9 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--exposure") a.exposure_us = std::stod(next());
         else if (k == "--cam-w") a.cam_width = std::stoi(next());
         else if (k == "--cam-h") a.cam_height = std::stoi(next());
+        else if (k == "--stream-w") a.stream_w = std::stoi(next());
+        else if (k == "--stream-h") a.stream_h = std::stoi(next());
+        else if (k == "--no-downsample") a.downsample = false;
         else if (k == "--fps") a.fps = std::stod(next());
         else if (k == "--max-frames") a.max_frames = std::max(0, std::stoi(next()));
         else if (k == "--track") a.track = true;
@@ -623,7 +638,7 @@ int run_stream_mode(const Args& args,
               << (show_window ? " or q/ESC in preview window" : "")
               << " to stop and finalize video." << std::endl;
 
-    cv::Mat raw_frame, frame, gray, vis;
+    cv::Mat raw_frame, undist_frame, frame, gray, vis;
     Undistorter undistorter;
     while (!g_stop_requested) {
         if (args.max_frames > 0 && frame_idx >= static_cast<long long>(args.max_frames)) break;
@@ -642,17 +657,35 @@ int run_stream_mode(const Args& args,
 
         const tav_pose::MvResolutionInfo* mv_res =
             (args.mode == InputMode::Camera) ? &mv_cam.resolution_info() : nullptr;
-        const auto K = build_intrinsics(args, raw_frame.size(), mv_res);
+        auto K = build_intrinsics(args, raw_frame.size(), mv_res);
         const bool do_undist = args.undistort &&
                                (args.mode == InputMode::Camera ||
                                 (raw_frame.cols == 1280 && raw_frame.rows == 1024));
-        undistorter.apply(raw_frame, frame, K, do_undist);
+        undistorter.apply(raw_frame, undist_frame, K, do_undist);
+
+        const bool did_downsample =
+            args.downsample && args.stream_w > 0 && args.stream_h > 0 &&
+            (undist_frame.cols != args.stream_w || undist_frame.rows != args.stream_h);
+        if (did_downsample) {
+            const double sx = static_cast<double>(args.stream_w) / undist_frame.cols;
+            const double sy = static_cast<double>(args.stream_h) / undist_frame.rows;
+            cv::resize(undist_frame, frame, cv::Size(args.stream_w, args.stream_h),
+                       0.0, 0.0, cv::INTER_AREA);
+            K.fx *= sx;
+            K.fy *= sy;
+            K.cx *= sx;
+            K.cy *= sy;
+        } else {
+            frame = undist_frame;
+        }
 
         if (frame_idx == 0) {
-            std::cout << "[Main] First frame captured: " << frame.cols << "x" << frame.rows
+            std::cout << "[Main] First frame: raw=" << raw_frame.cols << "x" << raw_frame.rows
+                      << " -> work=" << frame.cols << "x" << frame.rows
                       << " ch=" << frame.channels()
                       << " K=(" << K.fx << "," << K.fy << "," << K.cx << "," << K.cy << ")"
-                      << (do_undist ? " [undistort ON]" : "") << std::endl;
+                      << (do_undist ? " [undistort ON]" : "")
+                      << (did_downsample ? " [INTER_AREA downsample]" : "") << std::endl;
         }
 
         if (frame.channels() == 1) {
@@ -739,11 +772,27 @@ int main(int argc, char** argv) {
 
         std::unique_ptr<tav_pose::YoloDetector> detector;
         if (args.roi_str.empty()) {
+            int dw = args.det_w;
+            int dh = args.det_h;
+            if (dw <= 0 || dh <= 0) {
+                if (args.imgsz > 0) {
+                    dw = args.imgsz;
+                    dh = args.imgsz;
+                } else if (args.model_path.find("416") != std::string::npos) {
+                    dw = 416;
+                    dh = 416;
+                } else {
+                    dw = 448;
+                    dh = 336;
+                }
+            }
             std::vector<std::string> names;
             names.reserve(bank.size());
             for (const auto& t : bank) names.push_back(t.name);
             detector = std::make_unique<tav_pose::YoloDetector>(
-                args.model_path, std::move(names), args.imgsz, args.conf, 0.45f, !args.use_bgr);
+                args.model_path, std::move(names), dw, dh, args.conf, 0.45f, !args.use_bgr);
+            std::cout << "[Init] Detector: " << args.model_path << " (" << dw << "x" << dh
+                      << ", conf=" << args.conf << ")\n";
         }
 
         if (args.mode == InputMode::Image) {

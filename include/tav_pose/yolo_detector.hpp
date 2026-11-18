@@ -7,25 +7,53 @@
 
 namespace tav_pose {
 
+/// Unified ONNX detector supporting both YOLOv8 (3D tensor) and IFL-Net anchor-free (multi-scale 4D heads).
 class YoloDetector {
 public:
     YoloDetector(const std::string& onnx_path,
                  std::vector<std::string> class_names,
-                 int imgsz = 416,
-                 float conf_thresh = 0.25f,
+                 int input_w = 448,
+                 int input_h = 336,
+                 float conf_thresh = 0.28f,
                  float nms_thresh = 0.45f,
                  bool use_gray_3ch = true);
 
     std::vector<Detection> detect(const cv::Mat& bgr) const;
 
+    int input_width() const { return input_w_; }
+    int input_height() const { return input_h_; }
+
 private:
+    void decode_yolov8(const cv::Mat& out_raw,
+                       int orig_w,
+                       int orig_h,
+                       float scale,
+                       int left,
+                       int top,
+                       std::vector<cv::Rect>& nms_boxes,
+                       std::vector<cv::Rect2f>& raw_boxes,
+                       std::vector<float>& scores,
+                       std::vector<int>& class_ids) const;
+
+    void decode_ifl_net(const std::vector<cv::Mat>& outs,
+                        int orig_w,
+                        int orig_h,
+                        float scale,
+                        int left,
+                        int top,
+                        std::vector<cv::Rect>& nms_boxes,
+                        std::vector<cv::Rect2f>& raw_boxes,
+                        std::vector<float>& scores,
+                        std::vector<int>& class_ids) const;
+
     mutable cv::dnn::Net net_;
+    std::vector<std::string> out_names_;
     std::vector<std::string> class_names_;
-    int imgsz_;
+    int input_w_;
+    int input_h_;
     float conf_thresh_;
     float nms_thresh_;
     bool use_gray_3ch_;
 };
 
 }  // namespace tav_pose
-

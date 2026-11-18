@@ -6,15 +6,20 @@
 #include <stdexcept>
 
 namespace tav_pose {
+namespace {
+constexpr int kClassOffset = 7680;
+}
 
 YoloDetector::YoloDetector(const std::string& onnx_path,
                            std::vector<std::string> class_names,
-                           int imgsz,
+                           int input_w,
+                           int input_h,
                            float conf_thresh,
                            float nms_thresh,
                            bool use_gray_3ch)
     : class_names_(std::move(class_names)),
-      imgsz_(imgsz),
+      input_w_(input_w),
+      input_h_(input_h),
       conf_thresh_(conf_thresh),
       nms_thresh_(nms_thresh),
       use_gray_3ch_(use_gray_3ch) {
@@ -24,65 +29,28 @@ YoloDetector::YoloDetector(const std::string& onnx_path,
     }
     net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
     net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    const auto cv_names = net_.getUnconnectedOutLayersNames();
+    out_names_.assign(cv_names.begin(), cv_names.end());
 }
 
-std::vector<Detection> YoloDetector::detect(const cv::Mat& bgr) const {
-    if (bgr.empty()) return {};
-
-    cv::Mat src;
-    if (use_gray_3ch_) {
-        cv::Mat gray;
-        if (bgr.channels() == 3) {
-            cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-        } else {
-            gray = bgr;
-        }
-        cv::cvtColor(gray, src, cv::COLOR_GRAY2BGR);
-    } else if (bgr.channels() == 1) {
-        cv::cvtColor(bgr, src, cv::COLOR_GRAY2BGR);
-    } else {
-        src = bgr;
-    }
-
-    const int orig_w = src.cols;
-    const int orig_h = src.rows;
-    const float scale = std::min(static_cast<float>(imgsz_) / orig_w,
-                                 static_cast<float>(imgsz_) / orig_h);
-    const int nw = std::max(1, static_cast<int>(std::round(orig_w * scale)));
-    const int nh = std::max(1, static_cast<int>(std::round(orig_h * scale)));
-
-    const double pad_w = (imgsz_ - nw) * 0.5;
-    const double pad_h = (imgsz_ - nh) * 0.5;
-    const int top = std::max(0, static_cast<int>(std::round(pad_h - 0.1)));
-    const int left = std::max(0, static_cast<int>(std::round(pad_w - 0.1)));
-    const int bottom = std::max(0, imgsz_ - nh - top);
-    const int right = std::max(0, imgsz_ - nw - left);
-
-    cv::Mat resized, canvas;
-    cv::resize(src, resized, cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
-    cv::copyMakeBorder(resized, canvas, top, bottom, left, right,
-                       cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
-
-    cv::Mat blob = cv::dnn::blobFromImage(
-        canvas, 1.0 / 255.0, cv::Size(imgsz_, imgsz_), cv::Scalar(), true, false, CV_32F);
-    net_.setInput(blob);
-    cv::Mat out_raw = net_.forward();
+void YoloDetector::decode_yolov8(const cv::Mat& out_raw,
+                                 int orig_w,
+                                 int orig_h,
+                                 float scale,
+                                 int left,
+                                 int top,
+                                 std::vector<cv::Rect>& nms_boxes,
+                                 std::vector<cv::Rect2f>& raw_boxes,
+                                 std::vector<float>& scores,
+                                 std::vector<int>& class_ids) const {
     cv::Mat out = out_raw.isContinuous() ? out_raw : out_raw.clone();
-
-    // Expected YOLOv8 detect output shape: (1, 4 + nc, num_anchors)
     if (out.dims != 3 || out.size[0] != 1 || out.size[1] < 5) {
-        throw std::runtime_error("Unexpected ONNX output tensor shape");
+        throw std::runtime_error("Unexpected YOLOv8 ONNX output tensor shape");
     }
     const int channels = out.size[1];
     const int num_anchors = out.size[2];
     const int nc = channels - 4;
     const float* data = out.ptr<float>();
-
-    std::vector<cv::Rect> nms_boxes;
-    std::vector<cv::Rect2f> raw_boxes;
-    std::vector<float> scores;
-    std::vector<int> class_ids;
-    constexpr int kClassOffset = 7680;
 
     for (int i = 0; i < num_anchors; ++i) {
         int best_cls = 0;
@@ -119,6 +87,167 @@ std::vector<Detection> YoloDetector::detect(const cv::Mat& bgr) const {
             std::max(1, static_cast<int>(std::round(y1 - y0))));
         scores.push_back(best_score);
         class_ids.push_back(best_cls);
+    }
+}
+
+void YoloDetector::decode_ifl_net(const std::vector<cv::Mat>& outs,
+                                  int orig_w,
+                                  int orig_h,
+                                  float scale,
+                                  int left,
+                                  int top,
+                                  std::vector<cv::Rect>& nms_boxes,
+                                  std::vector<cv::Rect2f>& raw_boxes,
+                                  std::vector<float>& scores,
+                                  std::vector<int>& class_ids) const {
+    const int nc = static_cast<int>(class_names_.size());
+    std::vector<cv::Mat> hm_list, rg_list;
+    for (const auto& m : outs) {
+        if (m.dims != 4 || m.size[0] != 1) continue;
+        cv::Mat mc = m.isContinuous() ? m : m.clone();
+        if (mc.size[1] == nc && nc != 4) {
+            hm_list.push_back(mc);
+        } else if (mc.size[1] == 4) {
+            rg_list.push_back(mc);
+        }
+    }
+    if (hm_list.empty() || rg_list.empty()) {
+        throw std::runtime_error("Unexpected IFL-Net ONNX output tensor shapes");
+    }
+
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+
+    for (const auto& hm : hm_list) {
+        const int H = hm.size[2];
+        const int W = hm.size[3];
+        const cv::Mat* rg_match = nullptr;
+        for (const auto& rg : rg_list) {
+            if (rg.size[2] == H && rg.size[3] == W) {
+                rg_match = &rg;
+                break;
+            }
+        }
+        if (!rg_match) continue;
+
+        const float stride = static_cast<float>(input_w_) / static_cast<float>(W);
+        const int HW = H * W;
+        const float* hm_ptr = hm.ptr<float>();
+        const float* rg_ptr = rg_match->ptr<float>();
+
+        for (int c = 0; c < nc; ++c) {
+            cv::Mat hm_c(H, W, CV_32FC1, const_cast<float*>(hm_ptr + c * HW));
+            cv::Mat dilated;
+            cv::dilate(hm_c, dilated, kernel, cv::Point(-1, -1), 1, cv::BORDER_CONSTANT, cv::Scalar(0.0));
+
+            for (int y = 0; y < H; ++y) {
+                const float* hrow = hm_c.ptr<float>(y);
+                const float* drow = dilated.ptr<float>(y);
+                for (int x = 0; x < W; ++x) {
+                    const float sc = hrow[x];
+                    if (sc < conf_thresh_ || sc < drow[x] - 1e-7f) continue;
+
+                    const int idx = y * W + x;
+                    const float l = rg_ptr[0 * HW + idx];
+                    const float t = rg_ptr[1 * HW + idx];
+                    const float r = rg_ptr[2 * HW + idx];
+                    const float b = rg_ptr[3 * HW + idx];
+
+                    const float cx = (static_cast<float>(x) + 0.5f) * stride;
+                    const float cy = (static_cast<float>(y) + 0.5f) * stride;
+                    float x0 = (cx - l - static_cast<float>(left)) / scale;
+                    float y0 = (cy - t - static_cast<float>(top)) / scale;
+                    float x1 = (cx + r - static_cast<float>(left)) / scale;
+                    float y1 = (cy + b - static_cast<float>(top)) / scale;
+
+                    x0 = std::clamp(x0, 0.0f, static_cast<float>(orig_w - 1));
+                    y0 = std::clamp(y0, 0.0f, static_cast<float>(orig_h - 1));
+                    x1 = std::clamp(x1, x0 + 1.0f, static_cast<float>(orig_w));
+                    y1 = std::clamp(y1, y0 + 1.0f, static_cast<float>(orig_h));
+                    if ((x1 - x0) < 4.0f || (y1 - y0) < 4.0f) continue;
+
+                    raw_boxes.emplace_back(x0, y0, x1 - x0, y1 - y0);
+                    nms_boxes.emplace_back(
+                        static_cast<int>(std::round(x0)) + c * kClassOffset,
+                        static_cast<int>(std::round(y0)) + c * kClassOffset,
+                        std::max(1, static_cast<int>(std::round(x1 - x0))),
+                        std::max(1, static_cast<int>(std::round(y1 - y0))));
+                    scores.push_back(sc);
+                    class_ids.push_back(c);
+                }
+            }
+        }
+    }
+}
+
+std::vector<Detection> YoloDetector::detect(const cv::Mat& bgr) const {
+    if (bgr.empty()) return {};
+
+    cv::Mat src;
+    if (use_gray_3ch_) {
+        cv::Mat gray;
+        if (bgr.channels() == 3) {
+            cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+        } else {
+            gray = bgr;
+        }
+        cv::cvtColor(gray, src, cv::COLOR_GRAY2BGR);
+    } else if (bgr.channels() == 1) {
+        cv::cvtColor(bgr, src, cv::COLOR_GRAY2BGR);
+    } else {
+        src = bgr;
+    }
+
+    const int orig_w = src.cols;
+    const int orig_h = src.rows;
+    float scale = 1.0f;
+    int left = 0;
+    int top = 0;
+    cv::Mat canvas;
+
+    if (orig_w == input_w_ && orig_h == input_h_) {
+        canvas = src;
+    } else {
+        scale = std::min(static_cast<float>(input_w_) / orig_w,
+                         static_cast<float>(input_h_) / orig_h);
+        const int nw = std::max(1, static_cast<int>(std::round(orig_w * scale)));
+        const int nh = std::max(1, static_cast<int>(std::round(orig_h * scale)));
+
+        const double pad_w = (input_w_ - nw) * 0.5;
+        const double pad_h = (input_h_ - nh) * 0.5;
+        top = std::max(0, static_cast<int>(std::round(pad_h - 0.1)));
+        left = std::max(0, static_cast<int>(std::round(pad_w - 0.1)));
+        const int bottom = std::max(0, input_h_ - nh - top);
+        const int right = std::max(0, input_w_ - nw - left);
+
+        cv::Mat resized;
+        const int interp = (nw < orig_w || nh < orig_h) ? cv::INTER_AREA : cv::INTER_LINEAR;
+        cv::resize(src, resized, cv::Size(nw, nh), 0, 0, interp);
+        cv::copyMakeBorder(resized, canvas, top, bottom, left, right,
+                           cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
+    }
+
+    cv::Mat blob = cv::dnn::blobFromImage(
+        canvas, 1.0 / 255.0, cv::Size(input_w_, input_h_), cv::Scalar(), true, false, CV_32F);
+    net_.setInput(blob);
+
+    std::vector<cv::Mat> outs;
+    if (out_names_.empty()) {
+        outs.push_back(net_.forward());
+    } else {
+        net_.forward(outs, out_names_);
+    }
+
+    std::vector<cv::Rect> nms_boxes;
+    std::vector<cv::Rect2f> raw_boxes;
+    std::vector<float> scores;
+    std::vector<int> class_ids;
+
+    if (outs.size() == 1 && outs[0].dims == 3) {
+        decode_yolov8(outs[0], orig_w, orig_h, scale, left, top,
+                      nms_boxes, raw_boxes, scores, class_ids);
+    } else {
+        decode_ifl_net(outs, orig_w, orig_h, scale, left, top,
+                       nms_boxes, raw_boxes, scores, class_ids);
     }
 
     std::vector<int> keep;
