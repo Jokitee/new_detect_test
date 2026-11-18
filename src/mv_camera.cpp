@@ -102,34 +102,47 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
     }
 
     if (req_width > 0 && req_height > 0) {
+        const char* mode_tag = "preset";
         if (!found_preset) {
             CameraGetImageResolution(h_camera_, &target_res);
-            int w = std::clamp(req_width, min_w, max_width_);
-            int h = std::clamp(req_height, min_h, max_height_);
-            w = std::max(min_w, w & ~7);
-            h = std::max(min_h, h & ~7);
-            const int h_off = std::max(0, ((max_width_ - w) / 2) & ~7);
-            const int v_off = std::max(0, ((max_height_ - h) / 2) & ~7);
             target_res.iIndex = 0xFF;
             target_res.uBinSumMode = 0;
             target_res.uBinAverageMode = 0;
-            target_res.uSkipMode = 0;
             target_res.uResampleMask = 0;
-            target_res.iHOffsetFOV = h_off;
-            target_res.iVOffsetFOV = v_off;
-            target_res.iWidthFOV = w;
-            target_res.iHeightFOV = h;
-            target_res.iWidth = w;
-            target_res.iHeight = h;
             target_res.iWidthZoomHd = 0;
             target_res.iHeightZoomHd = 0;
             target_res.iWidthZoomSw = 0;
             target_res.iHeightZoomSw = 0;
+            if (req_width * 2 == max_width_ && req_height * 2 == max_height_ &&
+                (tCapability.sResolutionRange.uSkipModeMask & 0x1U) != 0U) {
+                mode_tag = "skip2x2";
+                target_res.uSkipMode = 1;
+                target_res.iHOffsetFOV = 0;
+                target_res.iVOffsetFOV = 0;
+                target_res.iWidthFOV = max_width_;
+                target_res.iHeightFOV = max_height_;
+                target_res.iWidth = req_width;
+                target_res.iHeight = req_height;
+            } else {
+                mode_tag = "custom_roi";
+                int w = std::clamp(req_width, min_w, max_width_);
+                int h = std::clamp(req_height, min_h, max_height_);
+                w = std::max(min_w, w & ~7);
+                h = std::max(min_h, h & ~7);
+                const int h_off = std::max(0, ((max_width_ - w) / 2) & ~7);
+                const int v_off = std::max(0, ((max_height_ - h) / 2) & ~7);
+                target_res.uSkipMode = 0;
+                target_res.iHOffsetFOV = h_off;
+                target_res.iVOffsetFOV = v_off;
+                target_res.iWidthFOV = w;
+                target_res.iHeightFOV = h;
+                target_res.iWidth = w;
+                target_res.iHeight = h;
+            }
         }
         const int res_status = CameraSetImageResolution(h_camera_, &target_res);
         std::printf("[MvCamera] CameraSetImageResolution(%dx%d, %s) status = %d\n",
-                    target_res.iWidth, target_res.iHeight,
-                    found_preset ? "preset" : "custom_roi", res_status);
+                    target_res.iWidth, target_res.iHeight, mode_tag, res_status);
         if (res_status != CAMERA_STATUS_SUCCESS) {
             std::printf("[MvCamera] Warning: CameraSetImageResolution rejected (status=%d); "
                         "check [MvCamera] Preset list or use --cam-w 0 --cam-h 0.\n", res_status);

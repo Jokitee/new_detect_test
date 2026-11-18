@@ -851,6 +851,11 @@ int main(int argc, char** argv) {
             std::cerr << "No templates loaded from " << args.templates_path << "\n";
             return 1;
         }
+        std::cout << "[Init] Templates (" << bank.size() << "): ";
+        for (size_t i = 0; i < bank.size(); ++i) {
+            std::cout << (i ? ", " : "") << bank[i].name;
+        }
+        std::cout << std::endl;
 
         std::unique_ptr<tav_pose::YoloDetector> detector;
         if (args.roi_str.empty()) {
