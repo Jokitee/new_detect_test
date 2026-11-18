@@ -108,6 +108,7 @@ struct Args {
     bool track = false;
     int redetect_every = 15;
     double vis_gain = 0.0;  // <= 0 -> auto brightness boost on dark frames
+    int threads = 0;        // > 0 -> cv::setNumThreads(threads)
 };
 
 void print_usage() {
@@ -148,6 +149,7 @@ void print_usage() {
         << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
         << "  --max-frames <N>     Optional frame limit (default 0 = unlimited until Ctrl+C/q/ESC)\n"
         << "  --vis-gain <double>  Display brightness gain (<=0 = auto 3x on dark frames)\n"
+        << "  --threads <int>      Optional cv::setNumThreads(N) (e.g. 1 if VM OpenCV hangs)\n"
         << "  --show               Display cv::imshow window (already enabled by default in camera/video mode)\n"
         << "  --no-show            Disable cv::imshow window (headless recording)\n";
 }
@@ -197,6 +199,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--track") a.track = true;
         else if (k == "--redetect-every") a.redetect_every = std::max(1, std::stoi(next()));
         else if (k == "--vis-gain") a.vis_gain = std::stod(next());
+        else if (k == "--threads") a.threads = std::max(1, std::stoi(next()));
         else if (k == "--bgr") a.use_bgr = true;
         else if (k == "--show") a.force_show = true;
         else if (k == "--no-show") a.no_show = true;
@@ -312,7 +315,8 @@ FrameMetrics process_frame(const cv::Mat& frame,
                            const tav_pose::CameraIntrinsics& K,
                            const Args& args,
                            TrackState* track_state,
-                           cv::Mat& vis_out) {
+                           cv::Mat& vis_out,
+                           bool trace_frame0 = false) {
     FrameMetrics metrics;
 
     const bool tracked =
@@ -327,12 +331,22 @@ FrameMetrics process_frame(const cv::Mat& frame,
             d.conf = 1.0f;
             dets.push_back(d);
         } else if (detector) {
+            if (trace_frame0) {
+                std::cout << "[Trace] Frame 0 calling detector->detect..." << std::endl;
+            }
             const auto t0 = std::chrono::steady_clock::now();
             dets = detector->detect(frame);
             const auto t1 = std::chrono::steady_clock::now();
             metrics.det_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (trace_frame0) {
+                std::cout << "[Trace] Frame 0 detector OK (dets=" << dets.size()
+                          << ", " << metrics.det_ms << "ms)" << std::endl;
+            }
         }
 
+        if (trace_frame0 && !dets.empty()) {
+            std::cout << "[Trace] Frame 0 running M1 on " << dets.size() << " det(s)..." << std::endl;
+        }
         for (const auto& d : dets) {
             const auto* tpl = find_template(bank, d.cls_name, d.cls_id);
             if (!tpl) continue;
@@ -344,6 +358,9 @@ FrameMetrics process_frame(const cv::Mat& frame,
                 metrics.pose_ms += item.pose.solve_ms;
             }
             metrics.targets.push_back(std::move(item));
+        }
+        if (trace_frame0) {
+            std::cout << "[Trace] Frame 0 M1 OK (" << metrics.pose_ms << "ms)" << std::endl;
         }
 
         if (track_state) {
@@ -748,11 +765,9 @@ int run_stream_mode(const Args& args,
             }
         }
 
-        if (frame_idx == 0) {
-            std::cout << "[Trace] Frame 0 running detector + M1..." << std::endl;
-        }
         const FrameMetrics metrics = process_frame(
-            frame, gray, detector, bank, K, args, args.track ? &track_state : nullptr, vis);
+            frame, gray, detector, bank, K, args,
+            args.track ? &track_state : nullptr, vis, frame_idx == 0);
 
         const auto now_tick = std::chrono::steady_clock::now();
         const double loop_s = std::chrono::duration<double>(now_tick - prev_tick).count();
@@ -766,9 +781,12 @@ int run_stream_mode(const Args& args,
         }
         draw_hud(vis, frame_idx + 1, ema_fps, metrics, valid_count);
         if (frame_idx == 0) {
-            std::cout << "[Trace] Frame 0 writing video..." << std::endl;
+            std::cout << "[Trace] Frame 0 calling writer.write..." << std::endl;
         }
         writer.write(vis);
+        if (frame_idx == 0) {
+            std::cout << "[Trace] Frame 0 writer.write OK." << std::endl;
+        }
         ++frame_idx;
 
         if (frame_idx == 1 || frame_idx % 30 == 0) {
@@ -820,7 +838,11 @@ int main(int argc, char** argv) {
 
     try {
         const Args args = parse_args(argc, argv);
+        if (args.threads > 0) {
+            cv::setNumThreads(args.threads);
+        }
         std::cout << "[Init] OpenCV version: " << CV_VERSION
+                  << " (threads=" << cv::getNumThreads() << ")"
                   << " | MVSDK: " << (tav_pose::MvCamera::sdk_available() ? "enabled" : "disabled")
                   << std::endl;
 

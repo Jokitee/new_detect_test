@@ -282,6 +282,9 @@ std::vector<Detection> YoloDetector::detect(const cv::Mat& bgr) const {
     }
     std::sort(detections.begin(), detections.end(),
               [](const Detection& a, const Detection& b) { return a.conf > b.conf; });
+    if (detections.size() > 32) {
+        detections.resize(32);
+    }
     return detections;
 }
 
