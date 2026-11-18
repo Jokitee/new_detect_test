@@ -1,6 +1,7 @@
 #include "tav_pose/mv_camera.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -10,6 +11,129 @@
 #endif
 
 namespace tav_pose {
+namespace {
+
+void sleep_interruptible(const std::atomic<bool>& running, int total_ms) {
+    constexpr int kStepMs = 40;
+    for (int elapsed = 0; elapsed < total_ms && running.load(); elapsed += kStepMs) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(kStepMs, total_ms - elapsed)));
+    }
+}
+
+#if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
+void ensure_sdk_initialized() {
+    static std::once_flag once;
+    std::call_once(once, []() { CameraSdkInit(1); });
+}
+
+void apply_requested_resolution(int h_camera,
+                                const tSdkCameraCapbility& cap,
+                                int req_w,
+                                int req_h,
+                                int max_w,
+                                int max_h,
+                                bool log_presets) {
+    const int min_w = std::max(16, cap.sResolutionRange.iWidthMin);
+    const int min_h = std::max(16, cap.sResolutionRange.iHeightMin);
+    if (log_presets) {
+        std::printf("[MvCamera] Range: [%d..%d] x [%d..%d] (skip=0x%x binSum=0x%x binAvg=0x%x)\n",
+                    min_w, max_w, min_h, max_h,
+                    cap.sResolutionRange.uSkipModeMask,
+                    cap.sResolutionRange.uBinSumModeMask,
+                    cap.sResolutionRange.uBinAverageModeMask);
+    }
+
+    const int n_presets = std::clamp(cap.iImageSizeDesc, 0, 64);
+    tSdkImageResolution target_res{};
+    bool found_preset = false;
+    if (cap.pImageSizeDesc != nullptr) {
+        for (int i = 0; i < n_presets; ++i) {
+            const tSdkImageResolution& p = cap.pImageSizeDesc[i];
+            if (log_presets) {
+                std::printf("[MvCamera] Preset %d: %.31s (%dx%d, FOV=%dx%d off=(%d,%d), bin=%u/%u skip=%u)\n",
+                            p.iIndex, p.acDescription, p.iWidth, p.iHeight,
+                            p.iWidthFOV, p.iHeightFOV, p.iHOffsetFOV, p.iVOffsetFOV,
+                            p.uBinSumMode, p.uBinAverageMode, p.uSkipMode);
+            }
+            if (req_w > 0 && req_h > 0 && !found_preset &&
+                p.iWidth == req_w && p.iHeight == req_h) {
+                target_res = p;
+                found_preset = true;
+            }
+        }
+    }
+    if (log_presets) std::fflush(stdout);
+
+    if (req_w <= 0 || req_h <= 0) return;
+
+    const char* mode_tag = "preset";
+    if (!found_preset) {
+        CameraGetImageResolution(h_camera, &target_res);
+        target_res.iIndex = 0xFF;
+        target_res.uBinSumMode = 0;
+        target_res.uBinAverageMode = 0;
+        target_res.uResampleMask = 0;
+        target_res.iWidthZoomHd = 0;
+        target_res.iHeightZoomHd = 0;
+        target_res.iWidthZoomSw = 0;
+        target_res.iHeightZoomSw = 0;
+        if (req_w * 2 == max_w && req_h * 2 == max_h &&
+            (cap.sResolutionRange.uSkipModeMask & 0x1U) != 0U) {
+            mode_tag = "skip2x2";
+            target_res.uSkipMode = 1;
+            target_res.iHOffsetFOV = 0;
+            target_res.iVOffsetFOV = 0;
+            target_res.iWidthFOV = max_w;
+            target_res.iHeightFOV = max_h;
+            target_res.iWidth = req_w;
+            target_res.iHeight = req_h;
+        } else {
+            mode_tag = "custom_roi";
+            int w = std::clamp(req_w, min_w, max_w);
+            int h = std::clamp(req_h, min_h, max_h);
+            w = std::max(min_w, w & ~7);
+            h = std::max(min_h, h & ~7);
+            target_res.uSkipMode = 0;
+            target_res.iHOffsetFOV = std::max(0, ((max_w - w) / 2) & ~7);
+            target_res.iVOffsetFOV = std::max(0, ((max_h - h) / 2) & ~7);
+            target_res.iWidthFOV = w;
+            target_res.iHeightFOV = h;
+            target_res.iWidth = w;
+            target_res.iHeight = h;
+        }
+    }
+    const int res_status = CameraSetImageResolution(h_camera, &target_res);
+    std::printf("[MvCamera] CameraSetImageResolution(%dx%d, %s) status = %d\n",
+                target_res.iWidth, target_res.iHeight, mode_tag, res_status);
+    if (res_status != CAMERA_STATUS_SUCCESS) {
+        std::printf("[MvCamera] Warning: CameraSetImageResolution rejected (status=%d); "
+                    "check [MvCamera] Preset list or use --cam-w 0 --cam-h 0.\n", res_status);
+    }
+}
+
+MvResolutionInfo query_active_resolution(int h_camera, bool log_active) {
+    tSdkImageResolution cur_res{};
+    MvResolutionInfo info{};
+    if (CameraGetImageResolution(h_camera, &cur_res) == CAMERA_STATUS_SUCCESS) {
+        info.valid = true;
+        info.h_offset = cur_res.iHOffsetFOV;
+        info.v_offset = cur_res.iVOffsetFOV;
+        info.fov_width = (cur_res.iWidthFOV > 0) ? cur_res.iWidthFOV : cur_res.iWidth;
+        info.fov_height = (cur_res.iHeightFOV > 0) ? cur_res.iHeightFOV : cur_res.iHeight;
+        info.out_width = cur_res.iWidth;
+        info.out_height = cur_res.iHeight;
+        if (log_active) {
+            std::printf("[MvCamera] Active resolution: %dx%d (FOV=%dx%d off=(%d,%d))\n",
+                        info.out_width, info.out_height,
+                        info.fov_width, info.fov_height,
+                        info.h_offset, info.v_offset);
+        }
+    }
+    return info;
+}
+#endif
+
+}  // namespace
 
 bool MvCamera::sdk_available() {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
@@ -23,77 +147,79 @@ MvCamera::~MvCamera() {
     close();
 }
 
-void MvCamera::open(double exposure_us, int req_width, int req_height) {
+MvResolutionInfo MvCamera::resolution_info() const {
+    std::lock_guard<std::mutex> lk(frame_mutex_);
+    return res_info_;
+}
+
+void MvCamera::configure_hardware(bool is_mono_sensor) {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
-    close();
+    CameraSetAeState(h_camera_, false);
+    const int set_stat = CameraSetExposureTime(h_camera_, req_exposure_us_);
+    CameraSetGain(h_camera_, 100, 70, 50);
+    std::printf("statue = %d\n", set_stat);
+
+    if (is_mono_sensor) {
+        CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_MONO8);
+    } else {
+        CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_BGR8);
+    }
+    std::fflush(stdout);
+#else
+    (void)is_mono_sensor;
+#endif
+}
+
+bool MvCamera::init_hardware(bool throw_on_error, bool quiet_enum_fail) {
+#if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
+    close_hardware();
+    ensure_sdk_initialized();
+
+    auto fail = [&](const char* msg) -> bool {
+        close_hardware();
+        if (throw_on_error) {
+            throw std::runtime_error(msg);
+        }
+        return false;
+    };
 
     int iCameraCounts = 1;
-    int iStatues = -1;
-    int setStatues = -1;
     tSdkCameraDevInfo tCameraEnumList{};
     tSdkCameraCapbility tCapability{};
 
-    CameraSdkInit(1);
-
-    iStatues = CameraEnumerateDevice(&tCameraEnumList, &iCameraCounts);
-    std::printf("statue = %d\n", iStatues);
-    std::printf("count = %d\n", iCameraCounts);
+    const int enum_status = CameraEnumerateDevice(&tCameraEnumList, &iCameraCounts);
+    if (!quiet_enum_fail || iCameraCounts > 0) {
+        std::printf("statue = %d\n", enum_status);
+        std::printf("count = %d\n", iCameraCounts);
+    }
     if (iCameraCounts == 0) {
-        throw std::runtime_error("MindVision camera not found (iCameraCounts == 0).");
+        return fail("MindVision camera not found (iCameraCounts == 0).");
     }
 
-    iStatues = CameraInit(&tCameraEnumList, -1, -1, &h_camera_);
-    std::printf("state = %d\n", iStatues);
-    if (iStatues != CAMERA_STATUS_SUCCESS) {
+    const int init_status = CameraInit(&tCameraEnumList, -1, -1, &h_camera_);
+    std::printf("state = %d\n", init_status);
+    if (init_status != CAMERA_STATUS_SUCCESS) {
         h_camera_ = -1;
-        throw std::runtime_error("CameraInit failed.");
+        return fail("CameraInit failed.");
     }
 
     if (CameraGetCapability(h_camera_, &tCapability) != CAMERA_STATUS_SUCCESS) {
-        close();
-        throw std::runtime_error("CameraGetCapability failed.");
+        return fail("CameraGetCapability failed.");
     }
 
     max_width_ = tCapability.sResolutionRange.iWidthMax;
     max_height_ = tCapability.sResolutionRange.iHeightMax;
     if (max_width_ <= 0 || max_height_ <= 0) {
-        close();
-        throw std::runtime_error("Invalid camera max resolution from CameraGetCapability.");
+        return fail("Invalid camera max resolution from CameraGetCapability.");
     }
 
     rgb_buffer_ = static_cast<unsigned char*>(std::malloc(
         static_cast<size_t>(max_height_) * static_cast<size_t>(max_width_) * 4U));
     if (!rgb_buffer_) {
-        close();
-        throw std::runtime_error("Failed to allocate camera ISP buffer.");
+        return fail("Failed to allocate camera ISP buffer.");
     }
 
-    const int min_w = std::max(16, tCapability.sResolutionRange.iWidthMin);
-    const int min_h = std::max(16, tCapability.sResolutionRange.iHeightMin);
-    std::printf("[MvCamera] Range: [%d..%d] x [%d..%d] (skip=0x%x binSum=0x%x binAvg=0x%x)\n",
-                min_w, max_width_, min_h, max_height_,
-                tCapability.sResolutionRange.uSkipModeMask,
-                tCapability.sResolutionRange.uBinSumModeMask,
-                tCapability.sResolutionRange.uBinAverageModeMask);
-
-    const int n_presets = std::clamp(tCapability.iImageSizeDesc, 0, 64);
-    tSdkImageResolution target_res{};
-    bool found_preset = false;
-    if (tCapability.pImageSizeDesc != nullptr) {
-        for (int i = 0; i < n_presets; ++i) {
-            const tSdkImageResolution& p = tCapability.pImageSizeDesc[i];
-            std::printf("[MvCamera] Preset %d: %.31s (%dx%d, FOV=%dx%d off=(%d,%d), bin=%u/%u skip=%u)\n",
-                        p.iIndex, p.acDescription, p.iWidth, p.iHeight,
-                        p.iWidthFOV, p.iHeightFOV, p.iHOffsetFOV, p.iVOffsetFOV,
-                        p.uBinSumMode, p.uBinAverageMode, p.uSkipMode);
-            if (req_width > 0 && req_height > 0 && !found_preset &&
-                p.iWidth == req_width && p.iHeight == req_height) {
-                target_res = p;
-                found_preset = true;
-            }
-        }
-    }
-    std::fflush(stdout);
+    mono_sensor_ = (tCapability.sIspCapacity.bMonoSensor != 0);
 
     // Follow example1.cpp & Catalyst-MDVS: enter CameraPlay before resolution/format calls.
     const int play_status = CameraPlay(h_camera_);
@@ -101,82 +227,175 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
         std::printf("[MvCamera] Warning: CameraPlay status = %d\n", play_status);
     }
 
-    if (req_width > 0 && req_height > 0) {
-        const char* mode_tag = "preset";
-        if (!found_preset) {
-            CameraGetImageResolution(h_camera_, &target_res);
-            target_res.iIndex = 0xFF;
-            target_res.uBinSumMode = 0;
-            target_res.uBinAverageMode = 0;
-            target_res.uResampleMask = 0;
-            target_res.iWidthZoomHd = 0;
-            target_res.iHeightZoomHd = 0;
-            target_res.iWidthZoomSw = 0;
-            target_res.iHeightZoomSw = 0;
-            if (req_width * 2 == max_width_ && req_height * 2 == max_height_ &&
-                (tCapability.sResolutionRange.uSkipModeMask & 0x1U) != 0U) {
-                mode_tag = "skip2x2";
-                target_res.uSkipMode = 1;
-                target_res.iHOffsetFOV = 0;
-                target_res.iVOffsetFOV = 0;
-                target_res.iWidthFOV = max_width_;
-                target_res.iHeightFOV = max_height_;
-                target_res.iWidth = req_width;
-                target_res.iHeight = req_height;
-            } else {
-                mode_tag = "custom_roi";
-                int w = std::clamp(req_width, min_w, max_width_);
-                int h = std::clamp(req_height, min_h, max_height_);
-                w = std::max(min_w, w & ~7);
-                h = std::max(min_h, h & ~7);
-                const int h_off = std::max(0, ((max_width_ - w) / 2) & ~7);
-                const int v_off = std::max(0, ((max_height_ - h) / 2) & ~7);
-                target_res.uSkipMode = 0;
-                target_res.iHOffsetFOV = h_off;
-                target_res.iVOffsetFOV = v_off;
-                target_res.iWidthFOV = w;
-                target_res.iHeightFOV = h;
-                target_res.iWidth = w;
-                target_res.iHeight = h;
+    apply_requested_resolution(h_camera_, tCapability, req_width_, req_height_,
+                               max_width_, max_height_, !quiet_enum_fail);
+
+    const MvResolutionInfo info = query_active_resolution(h_camera_, !quiet_enum_fail);
+    {
+        std::lock_guard<std::mutex> lk(frame_mutex_);
+        res_info_ = info;
+    }
+
+    configure_hardware(mono_sensor_);
+    return true;
+#else
+    (void)throw_on_error;
+    (void)quiet_enum_fail;
+    throw std::runtime_error(
+        "Binary was compiled without MVSDK (xmake f --with_mvsdk=true on Linux with MindVision SDK).");
+#endif
+}
+
+bool MvCamera::try_recover_connection(int last_status, int& reconnect_failures) {
+#if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
+    if (h_camera_ >= 0) {
+        const int conn_status = CameraConnectTest(h_camera_);
+        std::printf("[MvCamera] Timeout/disconnect (status=%d); CameraConnectTest=%d (attempt=%d)\n",
+                    last_status, conn_status, reconnect_failures + 1);
+        std::fflush(stdout);
+
+        // Try lightweight SDK reconnect first on first stall; escalate to full re-open if repeated.
+        if (reconnect_failures == 0) {
+            const int rec_status = CameraReConnect(h_camera_);
+            std::printf("[MvCamera] CameraReConnect status = %d\n", rec_status);
+            std::fflush(stdout);
+            if (rec_status == CAMERA_STATUS_SUCCESS &&
+                CameraConnectTest(h_camera_) == CAMERA_STATUS_SUCCESS) {
+                CameraPlay(h_camera_);
+                tSdkCameraCapbility cap{};
+                if (req_width_ > 0 && req_height_ > 0 &&
+                    CameraGetCapability(h_camera_, &cap) == CAMERA_STATUS_SUCCESS) {
+                    apply_requested_resolution(h_camera_, cap, req_width_, req_height_,
+                                               max_width_, max_height_, false);
+                }
+                const MvResolutionInfo info = query_active_resolution(h_camera_, false);
+                {
+                    std::lock_guard<std::mutex> lk(frame_mutex_);
+                    res_info_ = info;
+                }
+                configure_hardware(mono_sensor_);
+                ++reconnect_failures;
+                return true;
             }
         }
-        const int res_status = CameraSetImageResolution(h_camera_, &target_res);
-        std::printf("[MvCamera] CameraSetImageResolution(%dx%d, %s) status = %d\n",
-                    target_res.iWidth, target_res.iHeight, mode_tag, res_status);
-        if (res_status != CAMERA_STATUS_SUCCESS) {
-            std::printf("[MvCamera] Warning: CameraSetImageResolution rejected (status=%d); "
-                        "check [MvCamera] Preset list or use --cam-w 0 --cam-h 0.\n", res_status);
-        }
     }
 
-    tSdkImageResolution cur_res{};
-    if (CameraGetImageResolution(h_camera_, &cur_res) == CAMERA_STATUS_SUCCESS) {
-        res_info_.valid = true;
-        res_info_.h_offset = cur_res.iHOffsetFOV;
-        res_info_.v_offset = cur_res.iVOffsetFOV;
-        res_info_.fov_width = (cur_res.iWidthFOV > 0) ? cur_res.iWidthFOV : cur_res.iWidth;
-        res_info_.fov_height = (cur_res.iHeightFOV > 0) ? cur_res.iHeightFOV : cur_res.iHeight;
-        res_info_.out_width = cur_res.iWidth;
-        res_info_.out_height = cur_res.iHeight;
-        std::printf("[MvCamera] Active resolution: %dx%d (FOV=%dx%d off=(%d,%d))\n",
-                    res_info_.out_width, res_info_.out_height,
-                    res_info_.fov_width, res_info_.fov_height,
-                    res_info_.h_offset, res_info_.v_offset);
-    } else {
-        res_info_ = MvResolutionInfo{};
-    }
-
-    CameraSetAeState(h_camera_, false);
-    setStatues = CameraSetExposureTime(h_camera_, exposure_us);
-    CameraSetGain(h_camera_, 100, 70, 50);
-    std::printf("statue = %d\n", setStatues);
-
-    if (tCapability.sIspCapacity.bMonoSensor) {
-        CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_MONO8);
-    } else {
-        CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_BGR8);
-    }
+    std::printf("[MvCamera] Re-enumerating & reopening camera...\n");
     std::fflush(stdout);
+    close_hardware();
+    sleep_interruptible(running_, 250);
+    if (!running_.load()) return false;
+
+    if (init_hardware(false, true)) {
+        std::printf("[MvCamera] Camera recovered via full reopen.\n");
+        std::fflush(stdout);
+        reconnect_failures = 0;
+        grab_err_logs_ = 0;
+        return true;
+    }
+
+    ++reconnect_failures;
+    return false;
+#else
+    (void)last_status;
+    (void)reconnect_failures;
+    return false;
+#endif
+}
+
+void MvCamera::capture_loop() {
+#if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
+    int consec_timeouts = 0;
+    int reconnect_failures = 0;
+    int last_reopen_log = 0;
+
+    while (running_.load()) {
+        if (h_camera_ < 0 || !rgb_buffer_) {
+            sleep_interruptible(running_, 300);
+            if (!running_.load()) break;
+            if (init_hardware(false, true)) {
+                std::printf("[MvCamera] Camera reconnected.\n");
+                std::fflush(stdout);
+                consec_timeouts = 0;
+                reconnect_failures = 0;
+                last_reopen_log = 0;
+                grab_err_logs_ = 0;
+            } else {
+                ++reconnect_failures;
+                if (reconnect_failures == 1 || reconnect_failures - last_reopen_log >= 10) {
+                    last_reopen_log = reconnect_failures;
+                    std::printf("[MvCamera] Waiting for camera USB reconnection (tries=%d)...\n",
+                                reconnect_failures);
+                    std::fflush(stdout);
+                }
+            }
+            continue;
+        }
+
+        tSdkFrameHead sFrameInfo{};
+        BYTE* pbyBuffer = nullptr;
+        const int get_status = CameraGetImageBuffer(h_camera_, &sFrameInfo, &pbyBuffer, 150);
+        if (get_status != CAMERA_STATUS_SUCCESS || pbyBuffer == nullptr) {
+            if (!running_.load()) break;
+            const bool hard_drop = (get_status != CAMERA_STATUS_TIME_OUT);
+            ++consec_timeouts;
+            if (hard_drop || consec_timeouts >= 4) {
+                try_recover_connection(get_status, reconnect_failures);
+                consec_timeouts = 0;
+            }
+            continue;
+        }
+
+        consec_timeouts = 0;
+        reconnect_failures = 0;
+        const int proc_status = CameraImageProcess(h_camera_, pbyBuffer, rgb_buffer_, &sFrameInfo);
+        const int w = sFrameInfo.iWidth;
+        const int h = sFrameInfo.iHeight;
+        const bool dims_ok =
+            (proc_status == CAMERA_STATUS_SUCCESS) &&
+            (w > 0 && h > 0 && w <= max_width_ && h <= max_height_);
+
+        if (dims_ok) {
+            const int mat_type =
+                (sFrameInfo.uiMediaType == CAMERA_MEDIA_TYPE_MONO8) ? CV_8UC1 : CV_8UC3;
+            cv::Mat tmp;
+            cv::Mat(cv::Size(w, h), mat_type, rgb_buffer_).copyTo(tmp);
+            {
+                std::lock_guard<std::mutex> lk(frame_mutex_);
+                latest_frame_ = std::move(tmp);
+                ++frame_seq_;
+            }
+            frame_cv_.notify_one();
+        } else if (grab_err_logs_ < 10) {
+            ++grab_err_logs_;
+            std::printf("[MvCamera] Invalid processed frame (proc=%d, size=%dx%d, max=%dx%d)\n",
+                        proc_status, w, h, max_width_, max_height_);
+            std::fflush(stdout);
+        }
+
+        CameraReleaseImageBuffer(h_camera_, pbyBuffer);
+    }
+#endif
+}
+
+void MvCamera::open(double exposure_us, int req_width, int req_height) {
+#if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
+    close();
+    req_exposure_us_ = exposure_us;
+    req_width_ = req_width;
+    req_height_ = req_height;
+    grab_err_logs_ = 0;
+    {
+        std::lock_guard<std::mutex> lk(frame_mutex_);
+        latest_frame_.release();
+        frame_seq_ = 0;
+        consumed_seq_ = 0;
+    }
+
+    init_hardware(true, false);
+
+    running_.store(true);
+    capture_thread_ = std::thread(&MvCamera::capture_loop, this);
 #else
     (void)exposure_us;
     (void)req_width;
@@ -186,50 +405,31 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
 #endif
 }
 
-bool MvCamera::grab(cv::Mat& frame_out) {
+bool MvCamera::grab(cv::Mat& frame_out, int timeout_ms, MvResolutionInfo* res_out) {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
-    if (h_camera_ < 0 || !rgb_buffer_) return false;
-
-    tSdkFrameHead sFrameInfo{};
-    BYTE* pbyBuffer = nullptr;
-    const int get_status = CameraGetImageBuffer(h_camera_, &sFrameInfo, &pbyBuffer, 1000);
-    if (get_status != CAMERA_STATUS_SUCCESS || pbyBuffer == nullptr) {
-        if (get_status != CAMERA_STATUS_TIME_OUT && grab_err_logs_ < 10) {
-            ++grab_err_logs_;
-            std::printf("[MvCamera] CameraGetImageBuffer failed (status=%d)\n", get_status);
-            std::fflush(stdout);
-        }
+    std::unique_lock<std::mutex> lk(frame_mutex_);
+    const bool ready = frame_cv_.wait_for(
+        lk,
+        std::chrono::milliseconds(std::max(1, timeout_ms)),
+        [this]() { return !running_.load() || frame_seq_ > consumed_seq_; });
+    if (!ready || !running_.load() || frame_seq_ <= consumed_seq_ || latest_frame_.empty()) {
         return false;
     }
-
-    const int proc_status = CameraImageProcess(h_camera_, pbyBuffer, rgb_buffer_, &sFrameInfo);
-    const int w = sFrameInfo.iWidth;
-    const int h = sFrameInfo.iHeight;
-    const bool dims_ok =
-        (proc_status == CAMERA_STATUS_SUCCESS) &&
-        (w > 0 && h > 0 && w <= max_width_ && h <= max_height_);
-
-    if (dims_ok) {
-        const int mat_type =
-            (sFrameInfo.uiMediaType == CAMERA_MEDIA_TYPE_MONO8) ? CV_8UC1 : CV_8UC3;
-        cv::Mat matImage(cv::Size(w, h), mat_type, rgb_buffer_);
-        matImage.copyTo(frame_out);
-    } else if (grab_err_logs_ < 10) {
-        ++grab_err_logs_;
-        std::printf("[MvCamera] Invalid processed frame (proc=%d, size=%dx%d, max=%dx%d)\n",
-                    proc_status, w, h, max_width_, max_height_);
-        std::fflush(stdout);
+    frame_out = std::move(latest_frame_);
+    consumed_seq_ = frame_seq_;
+    if (res_out) {
+        *res_out = res_info_;
     }
-
-    CameraReleaseImageBuffer(h_camera_, pbyBuffer);
-    return dims_ok;
+    return true;
 #else
     (void)frame_out;
+    (void)timeout_ms;
+    (void)res_out;
     return false;
 #endif
 }
 
-void MvCamera::close() {
+void MvCamera::close_hardware() {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
     if (h_camera_ >= 0) {
         CameraPause(h_camera_);
@@ -245,8 +445,21 @@ void MvCamera::close() {
     }
     max_width_ = 0;
     max_height_ = 0;
-    grab_err_logs_ = 0;
+    std::lock_guard<std::mutex> lk(frame_mutex_);
     res_info_ = MvResolutionInfo{};
+}
+
+void MvCamera::close() {
+    running_.store(false);
+    frame_cv_.notify_all();
+    if (capture_thread_.joinable()) {
+        capture_thread_.join();
+    }
+    close_hardware();
+    std::lock_guard<std::mutex> lk(frame_mutex_);
+    latest_frame_.release();
+    frame_seq_ = 0;
+    consumed_seq_ = 0;
 }
 
 }  // namespace tav_pose

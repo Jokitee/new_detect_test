@@ -177,5 +177,6 @@ target("new_detect_test")
     end
     set_rundir("$(projectdir)")
     if is_plat("linux") then
+        add_syslinks("pthread")
         add_ldflags("-rdynamic")
     end

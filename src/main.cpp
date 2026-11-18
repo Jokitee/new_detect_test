@@ -704,13 +704,18 @@ int run_stream_mode(const Args& args,
         if (args.max_frames > 0 && frame_idx >= static_cast<long long>(args.max_frames)) break;
 
         bool got = false;
+        tav_pose::MvResolutionInfo cur_mv_res{};
         if (args.mode == InputMode::Camera) {
-            got = mv_cam.grab(raw_frame);
+            got = mv_cam.grab(raw_frame, 50, &cur_mv_res);
             if (!got || raw_frame.empty()) {
                 ++total_timeouts;
-                if (total_timeouts == 1 || total_timeouts % 10 == 0) {
+                if (total_timeouts == 1 || total_timeouts % 20 == 0) {
                     std::cout << "[Main] Waiting for camera frames (timeouts="
                               << total_timeouts << ")" << std::endl;
+                }
+                if (show_window && frame_idx > 0) {
+                    const int key = cv::waitKey(1) & 0xFF;
+                    if (key == 'q' || key == 'Q' || key == 27) break;
                 }
                 continue;
             }
@@ -720,7 +725,7 @@ int run_stream_mode(const Args& args,
         }
 
         const tav_pose::MvResolutionInfo* mv_res =
-            (args.mode == InputMode::Camera) ? &mv_cam.resolution_info() : nullptr;
+            (args.mode == InputMode::Camera) ? &cur_mv_res : nullptr;
         auto K = build_intrinsics(args, raw_frame.size(), mv_res);
         const bool do_undist = args.undistort &&
                                (args.mode == InputMode::Camera ||
