@@ -32,7 +32,7 @@ public:
 
     static bool sdk_available();
 
-    void open(double exposure_us = 4000.0, int req_width = 640, int req_height = 480);
+    void open(double exposure_us = 8000.0, int req_width = 640, int req_height = 480);
     bool grab(cv::Mat& frame_out, int timeout_ms = 50, MvResolutionInfo* res_out = nullptr);
     void close();
 
