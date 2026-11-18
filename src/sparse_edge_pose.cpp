@@ -55,7 +55,18 @@ double rot_err_deg(const cv::Matx33d& R1, const cv::Matx33d& R2) {
     return rad2deg(std::acos(c));
 }
 
+inline bool is_finite_pose(const cv::Matx33d& R, const cv::Vec3d& t) {
+    for (int r = 0; r < 3; ++r) {
+        if (!std::isfinite(t[r])) return false;
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(R(r, c))) return false;
+        }
+    }
+    return t[2] > 1.0;
+}
+
 inline float sample_bilinear_f32(const cv::Mat& img, float x, float y) {
+    if (!std::isfinite(x) || !std::isfinite(y) || img.empty()) return 0.0f;
     const int w = img.cols;
     const int h = img.rows;
     const float xc = std::clamp(x, 0.0f, static_cast<float>(w - 1));
@@ -304,6 +315,18 @@ void project_with_lie_jac(const CharTemplate& tpl,
     }
 }
 
+bool apply_lie_step(cv::Matx33d& R, cv::Vec3d& t, const cv::Vec6d& dx) {
+    for (int k = 0; k < 6; ++k) {
+        if (!std::isfinite(dx[k])) return false;
+    }
+    const cv::Matx33d R_next = rvec_to_mat(cv::Vec3d(dx[0], dx[1], dx[2])) * R;
+    const cv::Vec3d t_next = t + cv::Vec3d(dx[3], dx[4], dx[5]);
+    if (!is_finite_pose(R_next, t_next)) return false;
+    R = R_next;
+    t = t_next;
+    return true;
+}
+
 void refine_chamfer_gated(const cv::Mat& dt,
                           const cv::Mat& dtx,
                           const cv::Mat& dty,
@@ -356,9 +379,8 @@ void refine_chamfer_gated(const cv::Mat& dt,
 
         cv::Vec6d dx;
         if (!solve_6x6(H, g, dx)) break;
+        if (!apply_lie_step(R, t, dx)) break;
 
-        R = rvec_to_mat(cv::Vec3d(dx[0], dx[1], dx[2])) * R;
-        t += cv::Vec3d(dx[3], dx[4], dx[5]);
         double max_step = 0.0;
         for (int k = 0; k < 6; ++k) max_step = std::max(max_step, std::abs(dx[k]));
         if (max_step < 2e-4) break;
@@ -414,11 +436,12 @@ void refine_edges_lie(const cv::Mat& gs,
 
         cv::Vec6d dx;
         if (!solve_6x6(H, g, dx)) break;
-        R = rvec_to_mat(cv::Vec3d(dx[0], dx[1], dx[2])) * R;
-        t += cv::Vec3d(dx[3], dx[4], dx[5]);
+        if (!apply_lie_step(R, t, dx)) break;
 
-        std::nth_element(abs_e.begin(), abs_e.begin() + abs_e.size() / 2, abs_e.end());
-        out_med = abs_e[abs_e.size() / 2];
+        if (!abs_e.empty()) {
+            std::nth_element(abs_e.begin(), abs_e.begin() + abs_e.size() / 2, abs_e.end());
+            out_med = abs_e[abs_e.size() / 2];
+        }
         out_frac = static_cast<double>(es.n_valid) / static_cast<double>(tpl.points.size());
     }
 }
@@ -619,6 +642,7 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     const int y0 = std::max(0, static_cast<int>(std::floor(std::min(by0, min_cy))) - margin);
     const int x1 = std::min(W_im, static_cast<int>(std::ceil(std::max(bx1, max_cx))) + margin + 1);
     const int y1 = std::min(H_im, static_cast<int>(std::ceil(std::max(by1, max_cy))) + margin + 1);
+    if (x1 <= x0 + 1 || y1 <= y0 + 1 || K.fx <= 1.0 || K.fy <= 1.0) return res;
 
     cv::Mat sub_u8 = gray(cv::Rect(x0, y0, x1 - x0, y1 - y0));
     cv::Mat sub;
@@ -728,8 +752,9 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
         refine_chamfer_gated(dt, dtx, dty, R, t, tpl, Kc, 6, 8.0, 3.0);
         double med = 0.0, frac = 0.0;
         refine_edges_lie(gs, R, t, tpl, Kc, radii, med, frac, 1.5);
-        if (!std::isfinite(med)) continue;
+        if (!std::isfinite(med) || !is_finite_pose(R, t)) continue;
         const double phot = boundary_phot_contrast(gs, tpl, R, t, Kc);
+        if (!std::isfinite(phot)) continue;
         const double sc = phot * (frac * frac) - 2.0 * std::max(med - 0.5, 0.0);
         refined.push_back({R, t, sc, phot, med, frac});
     }
@@ -771,15 +796,18 @@ PoseResult SparseEdgePoseSolver::solve_tracking(const cv::Mat& gray,
     auto pts = project_points(tpl, prev_rvec, prev_tvec, K);
     double min_x = 1e9, max_x = -1e9, min_y = 1e9, max_y = -1e9;
     for (const auto& p : pts) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y)) return res;
         min_x = std::min(min_x, p.x);
         max_x = std::max(max_x, p.x);
         min_y = std::min(min_y, p.y);
         max_y = std::max(max_y, p.y);
     }
+    if (min_x > max_x || min_y > max_y || K.fx <= 1.0 || K.fy <= 1.0) return res;
     const int x0 = std::clamp(static_cast<int>(std::floor(min_x)) - margin, 0, gray.cols - 1);
     const int y0 = std::clamp(static_cast<int>(std::floor(min_y)) - margin, 0, gray.rows - 1);
     const int x1 = std::clamp(static_cast<int>(std::ceil(max_x)) + margin + 1, x0 + 1, gray.cols);
     const int y1 = std::clamp(static_cast<int>(std::ceil(max_y)) + margin + 1, y0 + 1, gray.rows);
+    if (x1 <= x0 + 1 || y1 <= y0 + 1) return res;
 
     cv::Mat sub, gs;
     gray(cv::Rect(x0, y0, x1 - x0, y1 - y0)).convertTo(sub, CV_32F);
@@ -793,7 +821,7 @@ PoseResult SparseEdgePoseSolver::solve_tracking(const cv::Mat& gray,
     cv::Vec3d t = prev_tvec;
     double med = 0.0, frac = 0.0;
     refine_edges_lie(gs, R, t, tpl, Kc, {4, 2, 2}, med, frac, 1.5);
-    if (!std::isfinite(med)) return res;
+    if (!std::isfinite(med) || !is_finite_pose(R, t)) return res;
 
     res.valid = true;
     res.rvec = mat_to_rvec(R);

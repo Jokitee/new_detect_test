@@ -176,3 +176,6 @@ target("new_detect_test")
         add_defines("TAV_WITH_MVSDK=0")
     end
     set_rundir("$(projectdir)")
+    if is_plat("linux") then
+        add_ldflags("-rdynamic")
+    end

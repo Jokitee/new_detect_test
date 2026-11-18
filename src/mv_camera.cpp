@@ -49,45 +49,76 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
         throw std::runtime_error("CameraInit failed.");
     }
 
-    CameraGetCapability(h_camera_, &tCapability);
+    if (CameraGetCapability(h_camera_, &tCapability) != CAMERA_STATUS_SUCCESS) {
+        close();
+        throw std::runtime_error("CameraGetCapability failed.");
+    }
+
+    max_width_ = tCapability.sResolutionRange.iWidthMax;
+    max_height_ = tCapability.sResolutionRange.iHeightMax;
+    if (max_width_ <= 0 || max_height_ <= 0) {
+        close();
+        throw std::runtime_error("Invalid camera max resolution from CameraGetCapability.");
+    }
 
     rgb_buffer_ = static_cast<unsigned char*>(std::malloc(
-        static_cast<size_t>(tCapability.sResolutionRange.iHeightMax) *
-        static_cast<size_t>(tCapability.sResolutionRange.iWidthMax) * 3U));
+        static_cast<size_t>(max_height_) * static_cast<size_t>(max_width_) * 4U));
     if (!rgb_buffer_) {
         close();
         throw std::runtime_error("Failed to allocate camera ISP buffer.");
     }
 
-    if (req_width > 0 && req_height > 0) {
-        tSdkImageResolution target_res{};
-        bool found_preset = false;
-        if (tCapability.pImageSizeDesc != nullptr) {
-            for (int i = 0; i < tCapability.iImageSizeDesc; ++i) {
-                const tSdkImageResolution& p = tCapability.pImageSizeDesc[i];
-                std::printf("[MvCamera] Preset %d: %.31s (%dx%d, FOV=%dx%d off=(%d,%d), bin=%u/%u skip=%u)\n",
-                            p.iIndex, p.acDescription, p.iWidth, p.iHeight,
-                            p.iWidthFOV, p.iHeightFOV, p.iHOffsetFOV, p.iVOffsetFOV,
-                            p.uBinSumMode, p.uBinAverageMode, p.uSkipMode);
-                if (!found_preset && p.iWidth == req_width && p.iHeight == req_height) {
-                    target_res = p;
-                    found_preset = true;
-                }
+    const int min_w = std::max(16, tCapability.sResolutionRange.iWidthMin);
+    const int min_h = std::max(16, tCapability.sResolutionRange.iHeightMin);
+    std::printf("[MvCamera] Range: [%d..%d] x [%d..%d] (skip=0x%x binSum=0x%x binAvg=0x%x)\n",
+                min_w, max_width_, min_h, max_height_,
+                tCapability.sResolutionRange.uSkipModeMask,
+                tCapability.sResolutionRange.uBinSumModeMask,
+                tCapability.sResolutionRange.uBinAverageModeMask);
+
+    const int n_presets = std::clamp(tCapability.iImageSizeDesc, 0, 64);
+    tSdkImageResolution target_res{};
+    bool found_preset = false;
+    if (tCapability.pImageSizeDesc != nullptr) {
+        for (int i = 0; i < n_presets; ++i) {
+            const tSdkImageResolution& p = tCapability.pImageSizeDesc[i];
+            std::printf("[MvCamera] Preset %d: %.31s (%dx%d, FOV=%dx%d off=(%d,%d), bin=%u/%u skip=%u)\n",
+                        p.iIndex, p.acDescription, p.iWidth, p.iHeight,
+                        p.iWidthFOV, p.iHeightFOV, p.iHOffsetFOV, p.iVOffsetFOV,
+                        p.uBinSumMode, p.uBinAverageMode, p.uSkipMode);
+            if (req_width > 0 && req_height > 0 && !found_preset &&
+                p.iWidth == req_width && p.iHeight == req_height) {
+                target_res = p;
+                found_preset = true;
             }
         }
+    }
+    std::fflush(stdout);
+
+    // Follow example1.cpp & Catalyst-MDVS: enter CameraPlay before resolution/format calls.
+    const int play_status = CameraPlay(h_camera_);
+    if (play_status != CAMERA_STATUS_SUCCESS) {
+        std::printf("[MvCamera] Warning: CameraPlay status = %d\n", play_status);
+    }
+
+    if (req_width > 0 && req_height > 0) {
         if (!found_preset) {
             CameraGetImageResolution(h_camera_, &target_res);
-            const int w = std::min(req_width, tCapability.sResolutionRange.iWidthMax);
-            const int h = std::min(req_height, tCapability.sResolutionRange.iHeightMax);
+            int w = std::clamp(req_width, min_w, max_width_);
+            int h = std::clamp(req_height, min_h, max_height_);
+            w = std::max(min_w, w & ~7);
+            h = std::max(min_h, h & ~7);
+            const int h_off = std::max(0, ((max_width_ - w) / 2) & ~7);
+            const int v_off = std::max(0, ((max_height_ - h) / 2) & ~7);
             target_res.iIndex = 0xFF;
             target_res.uBinSumMode = 0;
             target_res.uBinAverageMode = 0;
             target_res.uSkipMode = 0;
             target_res.uResampleMask = 0;
+            target_res.iHOffsetFOV = h_off;
+            target_res.iVOffsetFOV = v_off;
             target_res.iWidthFOV = w;
             target_res.iHeightFOV = h;
-            target_res.iHOffsetFOV = std::max(0, (tCapability.sResolutionRange.iWidthMax - w) / 2);
-            target_res.iVOffsetFOV = std::max(0, (tCapability.sResolutionRange.iHeightMax - h) / 2);
             target_res.iWidth = w;
             target_res.iHeight = h;
             target_res.iWidthZoomHd = 0;
@@ -99,6 +130,10 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
         std::printf("[MvCamera] CameraSetImageResolution(%dx%d, %s) status = %d\n",
                     target_res.iWidth, target_res.iHeight,
                     found_preset ? "preset" : "custom_roi", res_status);
+        if (res_status != CAMERA_STATUS_SUCCESS) {
+            std::printf("[MvCamera] Warning: CameraSetImageResolution rejected (status=%d); "
+                        "check [MvCamera] Preset list or use --cam-w 0 --cam-h 0.\n", res_status);
+        }
     }
 
     tSdkImageResolution cur_res{};
@@ -118,19 +153,17 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
         res_info_ = MvResolutionInfo{};
     }
 
-    CameraPlay(h_camera_);
-
     CameraSetAeState(h_camera_, false);
     setStatues = CameraSetExposureTime(h_camera_, exposure_us);
     CameraSetGain(h_camera_, 100, 70, 50);
     std::printf("statue = %d\n", setStatues);
-    std::fflush(stdout);
 
     if (tCapability.sIspCapacity.bMonoSensor) {
         CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_MONO8);
     } else {
         CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_BGR8);
     }
+    std::fflush(stdout);
 #else
     (void)exposure_us;
     (void)req_width;
@@ -146,19 +179,37 @@ bool MvCamera::grab(cv::Mat& frame_out) {
 
     tSdkFrameHead sFrameInfo{};
     BYTE* pbyBuffer = nullptr;
-    if (CameraGetImageBuffer(h_camera_, &sFrameInfo, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
-        CameraImageProcess(h_camera_, pbyBuffer, rgb_buffer_, &sFrameInfo);
-
-        cv::Mat matImage(
-            cv::Size(sFrameInfo.iWidth, sFrameInfo.iHeight),
-            sFrameInfo.uiMediaType == CAMERA_MEDIA_TYPE_MONO8 ? CV_8UC1 : CV_8UC3,
-            rgb_buffer_);
-        matImage.copyTo(frame_out);
-
-        CameraReleaseImageBuffer(h_camera_, pbyBuffer);
-        return true;
+    const int get_status = CameraGetImageBuffer(h_camera_, &sFrameInfo, &pbyBuffer, 1000);
+    if (get_status != CAMERA_STATUS_SUCCESS || pbyBuffer == nullptr) {
+        if (get_status != CAMERA_STATUS_TIME_OUT && grab_err_logs_ < 10) {
+            ++grab_err_logs_;
+            std::printf("[MvCamera] CameraGetImageBuffer failed (status=%d)\n", get_status);
+            std::fflush(stdout);
+        }
+        return false;
     }
-    return false;
+
+    const int proc_status = CameraImageProcess(h_camera_, pbyBuffer, rgb_buffer_, &sFrameInfo);
+    const int w = sFrameInfo.iWidth;
+    const int h = sFrameInfo.iHeight;
+    const bool dims_ok =
+        (proc_status == CAMERA_STATUS_SUCCESS) &&
+        (w > 0 && h > 0 && w <= max_width_ && h <= max_height_);
+
+    if (dims_ok) {
+        const int mat_type =
+            (sFrameInfo.uiMediaType == CAMERA_MEDIA_TYPE_MONO8) ? CV_8UC1 : CV_8UC3;
+        cv::Mat matImage(cv::Size(w, h), mat_type, rgb_buffer_);
+        matImage.copyTo(frame_out);
+    } else if (grab_err_logs_ < 10) {
+        ++grab_err_logs_;
+        std::printf("[MvCamera] Invalid processed frame (proc=%d, size=%dx%d, max=%dx%d)\n",
+                    proc_status, w, h, max_width_, max_height_);
+        std::fflush(stdout);
+    }
+
+    CameraReleaseImageBuffer(h_camera_, pbyBuffer);
+    return dims_ok;
 #else
     (void)frame_out;
     return false;
@@ -168,6 +219,7 @@ bool MvCamera::grab(cv::Mat& frame_out) {
 void MvCamera::close() {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
     if (h_camera_ >= 0) {
+        CameraPause(h_camera_);
         CameraUnInit(h_camera_);
         h_camera_ = -1;
     }
@@ -178,6 +230,9 @@ void MvCamera::close() {
         std::free(rgb_buffer_);
         rgb_buffer_ = nullptr;
     }
+    max_width_ = 0;
+    max_height_ = 0;
+    grab_err_logs_ = 0;
     res_info_ = MvResolutionInfo{};
 }
 

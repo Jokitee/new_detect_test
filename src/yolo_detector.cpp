@@ -8,6 +8,39 @@
 namespace tav_pose {
 namespace {
 constexpr int kClassOffset = 7680;
+
+void append_decoded_box(float x0,
+                        float y0,
+                        float x1,
+                        float y1,
+                        float score,
+                        int cls_id,
+                        int orig_w,
+                        int orig_h,
+                        float min_side,
+                        std::vector<cv::Rect>& nms_boxes,
+                        std::vector<cv::Rect2f>& raw_boxes,
+                        std::vector<float>& scores,
+                        std::vector<int>& class_ids) {
+    if (!std::isfinite(x0) || !std::isfinite(y0) ||
+        !std::isfinite(x1) || !std::isfinite(y1) || !std::isfinite(score)) {
+        return;
+    }
+    x0 = std::clamp(x0, 0.0f, static_cast<float>(orig_w - 1));
+    y0 = std::clamp(y0, 0.0f, static_cast<float>(orig_h - 1));
+    x1 = std::clamp(x1, x0 + 1.0f, static_cast<float>(orig_w));
+    y1 = std::clamp(y1, y0 + 1.0f, static_cast<float>(orig_h));
+    if ((x1 - x0) < min_side || (y1 - y0) < min_side) return;
+
+    raw_boxes.emplace_back(x0, y0, x1 - x0, y1 - y0);
+    nms_boxes.emplace_back(
+        static_cast<int>(std::round(x0)) + cls_id * kClassOffset,
+        static_cast<int>(std::round(y0)) + cls_id * kClassOffset,
+        std::max(1, static_cast<int>(std::round(x1 - x0))),
+        std::max(1, static_cast<int>(std::round(y1 - y0))));
+    scores.push_back(score);
+    class_ids.push_back(cls_id);
+}
 }
 
 YoloDetector::YoloDetector(const std::string& onnx_path,
@@ -44,6 +77,7 @@ void YoloDetector::decode_yolov8(const cv::Mat& out_raw,
                                  std::vector<float>& scores,
                                  std::vector<int>& class_ids) const {
     cv::Mat out = out_raw.isContinuous() ? out_raw : out_raw.clone();
+    if (out.depth() != CV_32F) out.convertTo(out, CV_32F);
     if (out.dims != 3 || out.size[0] != 1 || out.size[1] < 5) {
         throw std::runtime_error("Unexpected YOLOv8 ONNX output tensor shape");
     }
@@ -62,31 +96,20 @@ void YoloDetector::decode_yolov8(const cv::Mat& out_raw,
                 best_cls = c;
             }
         }
-        if (best_score < conf_thresh_) continue;
+        if (!std::isfinite(best_score) || best_score < conf_thresh_) continue;
 
         const float cx = data[0 * num_anchors + i];
         const float cy = data[1 * num_anchors + i];
         const float bw = data[2 * num_anchors + i];
         const float bh = data[3 * num_anchors + i];
 
-        float x0 = (cx - 0.5f * bw - static_cast<float>(left)) / scale;
-        float y0 = (cy - 0.5f * bh - static_cast<float>(top)) / scale;
-        float x1 = (cx + 0.5f * bw - static_cast<float>(left)) / scale;
-        float y1 = (cy + 0.5f * bh - static_cast<float>(top)) / scale;
-
-        x0 = std::clamp(x0, 0.0f, static_cast<float>(orig_w - 1));
-        y0 = std::clamp(y0, 0.0f, static_cast<float>(orig_h - 1));
-        x1 = std::clamp(x1, x0 + 1.0f, static_cast<float>(orig_w));
-        y1 = std::clamp(y1, y0 + 1.0f, static_cast<float>(orig_h));
-
-        raw_boxes.emplace_back(x0, y0, x1 - x0, y1 - y0);
-        nms_boxes.emplace_back(
-            static_cast<int>(std::round(x0)) + best_cls * kClassOffset,
-            static_cast<int>(std::round(y0)) + best_cls * kClassOffset,
-            std::max(1, static_cast<int>(std::round(x1 - x0))),
-            std::max(1, static_cast<int>(std::round(y1 - y0))));
-        scores.push_back(best_score);
-        class_ids.push_back(best_cls);
+        const float x0 = (cx - 0.5f * bw - static_cast<float>(left)) / scale;
+        const float y0 = (cy - 0.5f * bh - static_cast<float>(top)) / scale;
+        const float x1 = (cx + 0.5f * bw - static_cast<float>(left)) / scale;
+        const float y1 = (cy + 0.5f * bh - static_cast<float>(top)) / scale;
+        append_decoded_box(x0, y0, x1, y1, best_score, best_cls,
+                           orig_w, orig_h, 1.0f,
+                           nms_boxes, raw_boxes, scores, class_ids);
     }
 }
 
@@ -105,6 +128,7 @@ void YoloDetector::decode_ifl_net(const std::vector<cv::Mat>& outs,
     for (const auto& m : outs) {
         if (m.dims != 4 || m.size[0] != 1) continue;
         cv::Mat mc = m.isContinuous() ? m : m.clone();
+        if (mc.depth() != CV_32F) mc.convertTo(mc, CV_32F);
         if (mc.size[1] == nc && nc != 4) {
             hm_list.push_back(mc);
         } else if (mc.size[1] == 4) {
@@ -120,6 +144,7 @@ void YoloDetector::decode_ifl_net(const std::vector<cv::Mat>& outs,
     for (const auto& hm : hm_list) {
         const int H = hm.size[2];
         const int W = hm.size[3];
+        if (H <= 0 || W <= 0) continue;
         const cv::Mat* rg_match = nullptr;
         for (const auto& rg : rg_list) {
             if (rg.size[2] == H && rg.size[3] == W) {
@@ -154,25 +179,13 @@ void YoloDetector::decode_ifl_net(const std::vector<cv::Mat>& outs,
 
                     const float cx = (static_cast<float>(x) + 0.5f) * stride;
                     const float cy = (static_cast<float>(y) + 0.5f) * stride;
-                    float x0 = (cx - l - static_cast<float>(left)) / scale;
-                    float y0 = (cy - t - static_cast<float>(top)) / scale;
-                    float x1 = (cx + r - static_cast<float>(left)) / scale;
-                    float y1 = (cy + b - static_cast<float>(top)) / scale;
-
-                    x0 = std::clamp(x0, 0.0f, static_cast<float>(orig_w - 1));
-                    y0 = std::clamp(y0, 0.0f, static_cast<float>(orig_h - 1));
-                    x1 = std::clamp(x1, x0 + 1.0f, static_cast<float>(orig_w));
-                    y1 = std::clamp(y1, y0 + 1.0f, static_cast<float>(orig_h));
-                    if ((x1 - x0) < 4.0f || (y1 - y0) < 4.0f) continue;
-
-                    raw_boxes.emplace_back(x0, y0, x1 - x0, y1 - y0);
-                    nms_boxes.emplace_back(
-                        static_cast<int>(std::round(x0)) + c * kClassOffset,
-                        static_cast<int>(std::round(y0)) + c * kClassOffset,
-                        std::max(1, static_cast<int>(std::round(x1 - x0))),
-                        std::max(1, static_cast<int>(std::round(y1 - y0))));
-                    scores.push_back(sc);
-                    class_ids.push_back(c);
+                    const float x0 = (cx - l - static_cast<float>(left)) / scale;
+                    const float y0 = (cy - t - static_cast<float>(top)) / scale;
+                    const float x1 = (cx + r - static_cast<float>(left)) / scale;
+                    const float y1 = (cy + b - static_cast<float>(top)) / scale;
+                    append_decoded_box(x0, y0, x1, y1, sc, c,
+                                       orig_w, orig_h, 4.0f,
+                                       nms_boxes, raw_boxes, scores, class_ids);
                 }
             }
         }
@@ -251,7 +264,9 @@ std::vector<Detection> YoloDetector::detect(const cv::Mat& bgr) const {
     }
 
     std::vector<int> keep;
-    cv::dnn::NMSBoxes(nms_boxes, scores, conf_thresh_, nms_thresh_, keep);
+    if (!nms_boxes.empty()) {
+        cv::dnn::NMSBoxes(nms_boxes, scores, conf_thresh_, nms_thresh_, keep);
+    }
 
     std::vector<Detection> detections;
     detections.reserve(keep.size());

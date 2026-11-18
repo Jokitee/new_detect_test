@@ -25,6 +25,11 @@
 #include <string>
 #include <vector>
 
+#ifdef __linux__
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -33,6 +38,32 @@ volatile std::sig_atomic_t g_stop_requested = 0;
 
 void handle_signal(int) {
     g_stop_requested = 1;
+}
+
+void handle_crash_signal(int sig) {
+#ifdef __linux__
+    const char msg[] = "\n[FATAL] Program crashed with signal (backtrace):\n";
+    const ssize_t wrote = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)wrote;
+    void* frames[32];
+    const int n = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+#else
+    (void)sig;
+#endif
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+void install_crash_handlers() {
+#ifdef __linux__
+    void* warm[1];
+    (void)backtrace(warm, 1);  // Pre-load libgcc unwinder outside signal context.
+    std::signal(SIGSEGV, handle_crash_signal);
+    std::signal(SIGABRT, handle_crash_signal);
+    std::signal(SIGFPE, handle_crash_signal);
+    std::signal(SIGBUS, handle_crash_signal);
+#endif
 }
 
 enum class InputMode {
@@ -346,6 +377,10 @@ FrameMetrics process_frame(const cv::Mat& frame,
         const auto pts = tav_pose::SparseEdgePoseSolver::project_points(
             *item.tpl, item.pose.rvec, item.pose.tvec, K);
         for (const auto& q : pts) {
+            if (!std::isfinite(q.x) || !std::isfinite(q.y) ||
+                std::abs(q.x) > 10000.0 || std::abs(q.y) > 10000.0) {
+                continue;
+            }
             cv::circle(vis_out,
                        cv::Point(static_cast<int>(std::round(q.x)),
                                  static_cast<int>(std::round(q.y))),
@@ -418,6 +453,8 @@ bool open_video_writer(cv::VideoWriter& writer,
     }
 
     for (const auto& c : codecs) {
+        std::cout << "[VideoWriter] Trying codec " << c << " (" << frame_size.width << "x"
+                  << frame_size.height << ") -> " << out_path << std::endl;
         if (writer.open(out_path, fourcc_from_str(c), fps, frame_size, true)) {
             std::cout << "[VideoWriter] OpenCV " << CV_VERSION << " recording "
                       << frame_size.width << "x" << frame_size.height
@@ -476,7 +513,10 @@ public:
                cv::Mat& dst,
                const tav_pose::CameraIntrinsics& K,
                bool enabled) {
-        if (!enabled || (K.k1 == 0.0 && K.k2 == 0.0 && K.p1 == 0.0 && K.p2 == 0.0 && K.k3 == 0.0)) {
+        if (src.empty() || !enabled || K.fx <= 1.0 || K.fy <= 1.0 ||
+            !std::isfinite(K.fx) || !std::isfinite(K.fy) ||
+            !std::isfinite(K.cx) || !std::isfinite(K.cy) ||
+            (K.k1 == 0.0 && K.k2 == 0.0 && K.p1 == 0.0 && K.p2 == 0.0 && K.k3 == 0.0)) {
             dst = src;
             return;
         }
@@ -598,6 +638,9 @@ int run_stream_mode(const Args& args,
     double target_fps = args.fps;
 
     if (args.mode == InputMode::Camera) {
+        std::cout << "[Main] Opening MindVision camera (req=" << args.cam_width << "x"
+                  << args.cam_height << ", exposure=" << args.exposure_us << "us)..."
+                  << std::endl;
         mv_cam.open(args.exposure_us, args.cam_width, args.cam_height);
         if (target_fps <= 0.0) target_fps = 30.0;
     } else {
@@ -646,8 +689,12 @@ int run_stream_mode(const Args& args,
         bool got = false;
         if (args.mode == InputMode::Camera) {
             got = mv_cam.grab(raw_frame);
-            if (!got) {
+            if (!got || raw_frame.empty()) {
                 ++total_timeouts;
+                if (total_timeouts == 1 || total_timeouts % 10 == 0) {
+                    std::cout << "[Main] Waiting for camera frames (timeouts="
+                              << total_timeouts << ")" << std::endl;
+                }
                 continue;
             }
         } else {
@@ -701,6 +748,9 @@ int run_stream_mode(const Args& args,
             }
         }
 
+        if (frame_idx == 0) {
+            std::cout << "[Trace] Frame 0 running detector + M1..." << std::endl;
+        }
         const FrameMetrics metrics = process_frame(
             frame, gray, detector, bank, K, args, args.track ? &track_state : nullptr, vis);
 
@@ -715,6 +765,9 @@ int run_stream_mode(const Args& args,
             if (t.pose.valid) ++valid_count;
         }
         draw_hud(vis, frame_idx + 1, ema_fps, metrics, valid_count);
+        if (frame_idx == 0) {
+            std::cout << "[Trace] Frame 0 writing video..." << std::endl;
+        }
         writer.write(vis);
         ++frame_idx;
 
@@ -726,8 +779,14 @@ int run_stream_mode(const Args& args,
         }
 
         if (show_window) {
+            if (frame_idx == 1) {
+                std::cout << "[Trace] Frame 0 calling cv::imshow..." << std::endl;
+            }
             cv::imshow("new_detect_test", vis);
             const int key = cv::waitKey(5) & 0xFF;
+            if (frame_idx == 1) {
+                std::cout << "[Trace] Frame 0 imshow OK." << std::endl;
+            }
             if (key == 'q' || key == 'Q' || key == 27) {
                 break;
             }
@@ -755,6 +814,7 @@ int run_stream_mode(const Args& args,
 }  // namespace
 
 int main(int argc, char** argv) {
+    install_crash_handlers();
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
@@ -762,7 +822,7 @@ int main(int argc, char** argv) {
         const Args args = parse_args(argc, argv);
         std::cout << "[Init] OpenCV version: " << CV_VERSION
                   << " | MVSDK: " << (tav_pose::MvCamera::sdk_available() ? "enabled" : "disabled")
-                  << "\n";
+                  << std::endl;
 
         const auto bank = tav_pose::load_templates_csv(args.templates_path);
         if (bank.empty()) {
@@ -792,7 +852,7 @@ int main(int argc, char** argv) {
             detector = std::make_unique<tav_pose::YoloDetector>(
                 args.model_path, std::move(names), dw, dh, args.conf, 0.45f, !args.use_bgr);
             std::cout << "[Init] Detector: " << args.model_path << " (" << dw << "x" << dh
-                      << ", conf=" << args.conf << ")\n";
+                      << ", conf=" << args.conf << ")" << std::endl;
         }
 
         if (args.mode == InputMode::Image) {

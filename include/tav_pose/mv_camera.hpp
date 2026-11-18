@@ -34,6 +34,9 @@ public:
 
 private:
     int h_camera_ = -1;
+    int max_width_ = 0;
+    int max_height_ = 0;
+    int grab_err_logs_ = 0;
     unsigned char* rgb_buffer_ = nullptr;
     MvResolutionInfo res_info_;
 };
