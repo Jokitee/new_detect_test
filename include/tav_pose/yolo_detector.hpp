@@ -14,7 +14,7 @@ public:
                  std::vector<std::string> class_names,
                  int input_w = 448,
                  int input_h = 336,
-                 float conf_thresh = 0.28f,
+                 float conf_thresh = 0.45f,
                  float nms_thresh = 0.45f,
                  bool use_gray_3ch = true);
 

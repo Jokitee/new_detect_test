@@ -86,7 +86,7 @@ struct Args {
     int imgsz = -1;
     int det_w = -1;
     int det_h = -1;
-    float conf = 0.28f;
+    float conf = 0.45f;
     bool use_bgr = false;
     bool no_show = false;
     bool force_show = false;
@@ -126,7 +126,7 @@ void print_usage() {
         << "  --imgsz <int>        Square detector input size override (e.g. 416 for YOLOv8n)\n"
         << "  --det-w <int>        Detector input width (default 448, or 416 if YOLOv8 416)\n"
         << "  --det-h <int>        Detector input height (default 336, or 416 if YOLOv8 416)\n"
-        << "  --conf <float>       Detector confidence threshold (default 0.28)\n"
+        << "  --conf <float>       Detector confidence threshold (default 0.45)\n"
         << "  --bgr                Feed raw BGR instead of grayscale-BGR\n"
         << "  --f <double>         Override focal length px (default calibrated 1757.35/1754.99 on camera)\n"
         << "  --fy <double>        Override fy px\n"
