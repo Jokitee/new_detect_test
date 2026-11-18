@@ -50,7 +50,7 @@ private:
     int max_height_ = 0;
     int grab_err_logs_ = 0;
     bool mono_sensor_ = false;
-    double req_exposure_us_ = 4000.0;
+    double req_exposure_us_ = 8000.0;
     int req_width_ = 640;
     int req_height_ = 480;
     unsigned char* rgb_buffer_ = nullptr;

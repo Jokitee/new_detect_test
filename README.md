@@ -32,7 +32,7 @@ Useful configure options:
 
 ### 1. Live MindVision Camera -> Video Output (Default, Unlimited Frames)
 
-Captures `640x480` frames continuously without frame limit (`max_frames=0`) using `CameraSetImageResolution` in the `MdVison_edu/demo/example1.cpp` MindVision SDK flow (4 ms default exposure, automatic intrinsics & distortion adaptation from calibrated `1280x1024`), uniformly downsamples via `cv::INTER_AREA` to `448x336` (zero cropping, `K` scaled `0.7x` automatically), runs **IFL-Net V2-Slim (`448x336`)** + Pure-M1 pose estimation, displays `cv::imshow` directly (unless `--no-show` is passed), and writes annotated video via OpenCV `VideoWriter` until you stop with `Ctrl+C`, `q`, or `ESC`:
+Captures `640x480` frames continuously without frame limit (`max_frames=0`) using `CameraSetImageResolution` in the `MdVison_edu/demo/example1.cpp` MindVision SDK flow (8 ms default exposure, automatic intrinsics & distortion adaptation from calibrated `1280x1024`), uniformly downsamples via `cv::INTER_AREA` to `448x336` (zero cropping, `K` scaled `0.7x` automatically), runs **IFL-Net V2-Slim (`448x336`)** + Pure-M1 pose estimation, displays `cv::imshow` directly (unless `--no-show` is passed), and writes annotated video via OpenCV `VideoWriter` until you stop with `Ctrl+C`, `q`, or `ESC`:
 
 ```bash
 # Default pipeline: hardware 640x480 -> 448x336 INTER_AREA -> IFL-Net V2-Slim + Pure-M1

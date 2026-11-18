@@ -98,7 +98,7 @@ struct Args {
     bool undistort = true;
 
     // Camera & video output options
-    double exposure_us = 4000.0;  // 4 ms default exposure (only exposure differs from example1.cpp)
+    double exposure_us = 8000.0;  // 8 ms default exposure (only exposure differs from example1.cpp)
     int cam_width = 640;
     int cam_height = 480;
     bool downsample = true;       // 640x480 -> 448x336 (0.7x INTER_AREA, no crop)
@@ -139,8 +139,8 @@ void print_usage() {
         << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
         << "  --max-targets <N>    Max targets to solve per frame (default 0 = all, sorted by conf)\n"
         << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"
-        << "MindVision Camera options (follows example1.cpp; 640x480 hardware -> 448x336 downsample + 4ms exposure):\n"
-        << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n"
+        << "MindVision Camera options (follows example1.cpp; 640x480 hardware -> 448x336 downsample + 8ms exposure):\n"
+        << "  --exposure <us>      Manual exposure time in us (default 8000 = 8ms)\n"
         << "  --cam-w <int>        Hardware resolution width (default 640)\n"
         << "  --cam-h <int>        Hardware resolution height (default 480)\n"
         << "  --stream-w <int>     Downsampled working width without crop (default 448)\n"
