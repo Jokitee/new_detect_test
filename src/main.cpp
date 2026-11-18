@@ -65,6 +65,8 @@ struct Args {
 
     // Camera & video output options
     double exposure_us = 4000.0;  // 4 ms default exposure (only exposure differs from example1.cpp)
+    int cam_width = 640;
+    int cam_height = 480;
     double fps = 0.0;       // 0 -> auto (30.0 for camera, source FPS for video)
     int max_frames = 0;     // 0 -> unlimited
     bool track = false;
@@ -95,8 +97,10 @@ void print_usage() {
         << "  --track              Enable temporal Pure-M1 tracking between YOLO keyframes\n"
         << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
         << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"
-        << "MindVision Camera options (follows example1.cpp; only exposure configurable):\n"
-        << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n\n"
+        << "MindVision Camera options (follows example1.cpp; 640x480 hardware resolution + 4ms exposure):\n"
+        << "  --exposure <us>      Manual exposure time in us (default 4000 = 4ms)\n"
+        << "  --cam-w <int>        Hardware resolution width (default 640)\n"
+        << "  --cam-h <int>        Hardware resolution height (default 480)\n\n"
         << "Output options:\n"
         << "  --out <path>         Output video (.avi/.mp4) or image (.png) path\n"
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
@@ -140,6 +144,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--no-undistort") a.undistort = false;
         else if (k == "--bench") a.bench_runs = std::stoi(next());
         else if (k == "--exposure") a.exposure_us = std::stod(next());
+        else if (k == "--cam-w") a.cam_width = std::stoi(next());
+        else if (k == "--cam-h") a.cam_height = std::stoi(next());
         else if (k == "--fps") a.fps = std::stod(next());
         else if (k == "--max-frames") a.max_frames = std::max(0, std::stoi(next()));
         else if (k == "--track") a.track = true;
@@ -420,12 +426,23 @@ bool open_video_writer(cv::VideoWriter& writer,
     return false;
 }
 
-tav_pose::CameraIntrinsics build_intrinsics(const Args& args, const cv::Size& frame_size) {
+tav_pose::CameraIntrinsics build_intrinsics(const Args& args,
+                                            const cv::Size& frame_size,
+                                            const tav_pose::MvResolutionInfo* mv_res = nullptr) {
     tav_pose::CameraIntrinsics K;
     const bool use_calibrated =
         (args.fx <= 0.0) &&
         (args.mode == InputMode::Camera || (frame_size.width == 1280 && frame_size.height == 1024));
     if (use_calibrated) {
+        if (mv_res && mv_res->valid && mv_res->fov_width > 0 && mv_res->fov_height > 0 &&
+            mv_res->out_width > 0 && mv_res->out_height > 0) {
+            const double sx = static_cast<double>(mv_res->out_width) / mv_res->fov_width;
+            const double sy = static_cast<double>(mv_res->out_height) / mv_res->fov_height;
+            K.fx *= sx;
+            K.fy *= sy;
+            K.cx = (K.cx - mv_res->h_offset) * sx;
+            K.cy = (K.cy - mv_res->v_offset) * sy;
+        }
         if (args.cx >= 0.0) K.cx = args.cx;
         if (args.cy >= 0.0) K.cy = args.cy;
         return K;
@@ -566,7 +583,7 @@ int run_stream_mode(const Args& args,
     double target_fps = args.fps;
 
     if (args.mode == InputMode::Camera) {
-        mv_cam.open(args.exposure_us);
+        mv_cam.open(args.exposure_us, args.cam_width, args.cam_height);
         if (target_fps <= 0.0) target_fps = 30.0;
     } else {
         if (!video_cap.open(args.video_path)) {
@@ -623,7 +640,9 @@ int run_stream_mode(const Args& args,
             if (!got || raw_frame.empty()) break;
         }
 
-        const auto K = build_intrinsics(args, raw_frame.size());
+        const tav_pose::MvResolutionInfo* mv_res =
+            (args.mode == InputMode::Camera) ? &mv_cam.resolution_info() : nullptr;
+        const auto K = build_intrinsics(args, raw_frame.size(), mv_res);
         const bool do_undist = args.undistort &&
                                (args.mode == InputMode::Camera ||
                                 (raw_frame.cols == 1280 && raw_frame.rows == 1024));

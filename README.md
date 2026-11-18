@@ -31,10 +31,10 @@ Useful configure options:
 
 ### 1. Live MindVision Camera -> Video Output (Default, Unlimited Frames)
 
-Captures frames continuously without frame limit (`max_frames=0`) using the MindVision SDK flow matching `MdVison_edu/demo/example1.cpp` (only exposure is set to `4000 us` = `4 ms`; all other camera settings stay unchanged), applies calibrated `1280x1024` intrinsics & lens undistortion (`fx=1757.35, fy=1754.99, cx=639.50, cy=511.50`, `k1=-0.0369, k2=-0.2629, p1=+0.00549, p2=-0.00169, k3=+1.609`), runs YOLO + Pure-M1 pose estimation, displays `cv::imshow` directly (unless `--no-show` is passed), and writes an annotated video via OpenCV `VideoWriter` until you stop with `Ctrl+C`, `q`, or `ESC`:
+Captures `640x480` frames continuously without frame limit (`max_frames=0`) using `CameraSetImageResolution` in the `MdVison_edu/demo/example1.cpp` MindVision SDK flow (4 ms default exposure, automatic intrinsics & distortion adaptation from calibrated `1280x1024` `fx=1757.35, fy=1754.99, cx=639.50, cy=511.50`, `k1=-0.0369, k2=-0.2629, p1=+0.00549, p2=-0.00169, k3=+1.609`), runs YOLO + Pure-M1 pose estimation, displays `cv::imshow` directly (unless `--no-show` is passed), and writes an annotated video via OpenCV `VideoWriter` until you stop with `Ctrl+C`, `q`, or `ESC`:
 
 ```bash
-# Direct cv::imshow + unlimited recording -> out/mv_detect.mp4 (4ms exposure, example1.cpp camera flow)
+# Direct cv::imshow + 640x480 camera + unlimited recording -> out/mv_detect.mp4 (4ms exposure)
 xmake run new_detect_test --camera --out out/mv_detect.mp4 --fps 30
 
 # Live preview + unlimited video recording + temporal tracking

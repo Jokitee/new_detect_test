@@ -1,5 +1,6 @@
 #include "tav_pose/mv_camera.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -22,7 +23,7 @@ MvCamera::~MvCamera() {
     close();
 }
 
-void MvCamera::open(double exposure_us) {
+void MvCamera::open(double exposure_us, int req_width, int req_height) {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
     close();
 
@@ -58,6 +59,65 @@ void MvCamera::open(double exposure_us) {
         throw std::runtime_error("Failed to allocate camera ISP buffer.");
     }
 
+    if (req_width > 0 && req_height > 0) {
+        tSdkImageResolution target_res{};
+        bool found_preset = false;
+        if (tCapability.pImageSizeDesc != nullptr) {
+            for (int i = 0; i < tCapability.iImageSizeDesc; ++i) {
+                const tSdkImageResolution& p = tCapability.pImageSizeDesc[i];
+                std::printf("[MvCamera] Preset %d: %.31s (%dx%d, FOV=%dx%d off=(%d,%d), bin=%u/%u skip=%u)\n",
+                            p.iIndex, p.acDescription, p.iWidth, p.iHeight,
+                            p.iWidthFOV, p.iHeightFOV, p.iHOffsetFOV, p.iVOffsetFOV,
+                            p.uBinSumMode, p.uBinAverageMode, p.uSkipMode);
+                if (!found_preset && p.iWidth == req_width && p.iHeight == req_height) {
+                    target_res = p;
+                    found_preset = true;
+                }
+            }
+        }
+        if (!found_preset) {
+            CameraGetImageResolution(h_camera_, &target_res);
+            const int w = std::min(req_width, tCapability.sResolutionRange.iWidthMax);
+            const int h = std::min(req_height, tCapability.sResolutionRange.iHeightMax);
+            target_res.iIndex = 0xFF;
+            target_res.uBinSumMode = 0;
+            target_res.uBinAverageMode = 0;
+            target_res.uSkipMode = 0;
+            target_res.uResampleMask = 0;
+            target_res.iWidthFOV = w;
+            target_res.iHeightFOV = h;
+            target_res.iHOffsetFOV = std::max(0, (tCapability.sResolutionRange.iWidthMax - w) / 2);
+            target_res.iVOffsetFOV = std::max(0, (tCapability.sResolutionRange.iHeightMax - h) / 2);
+            target_res.iWidth = w;
+            target_res.iHeight = h;
+            target_res.iWidthZoomHd = 0;
+            target_res.iHeightZoomHd = 0;
+            target_res.iWidthZoomSw = 0;
+            target_res.iHeightZoomSw = 0;
+        }
+        const int res_status = CameraSetImageResolution(h_camera_, &target_res);
+        std::printf("[MvCamera] CameraSetImageResolution(%dx%d, %s) status = %d\n",
+                    target_res.iWidth, target_res.iHeight,
+                    found_preset ? "preset" : "custom_roi", res_status);
+    }
+
+    tSdkImageResolution cur_res{};
+    if (CameraGetImageResolution(h_camera_, &cur_res) == CAMERA_STATUS_SUCCESS) {
+        res_info_.valid = true;
+        res_info_.h_offset = cur_res.iHOffsetFOV;
+        res_info_.v_offset = cur_res.iVOffsetFOV;
+        res_info_.fov_width = (cur_res.iWidthFOV > 0) ? cur_res.iWidthFOV : cur_res.iWidth;
+        res_info_.fov_height = (cur_res.iHeightFOV > 0) ? cur_res.iHeightFOV : cur_res.iHeight;
+        res_info_.out_width = cur_res.iWidth;
+        res_info_.out_height = cur_res.iHeight;
+        std::printf("[MvCamera] Active resolution: %dx%d (FOV=%dx%d off=(%d,%d))\n",
+                    res_info_.out_width, res_info_.out_height,
+                    res_info_.fov_width, res_info_.fov_height,
+                    res_info_.h_offset, res_info_.v_offset);
+    } else {
+        res_info_ = MvResolutionInfo{};
+    }
+
     CameraPlay(h_camera_);
 
     CameraSetAeState(h_camera_, false);
@@ -73,6 +133,8 @@ void MvCamera::open(double exposure_us) {
     }
 #else
     (void)exposure_us;
+    (void)req_width;
+    (void)req_height;
     throw std::runtime_error(
         "Binary was compiled without MVSDK (xmake f --with_mvsdk=true on Linux with MindVision SDK).");
 #endif
@@ -116,6 +178,7 @@ void MvCamera::close() {
         std::free(rgb_buffer_);
         rgb_buffer_ = nullptr;
     }
+    res_info_ = MvResolutionInfo{};
 }
 
 }  // namespace tav_pose
