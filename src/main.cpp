@@ -80,7 +80,7 @@ struct Args {
     std::string templates_path = "assets/templates.csv";
     std::string out_path;
     std::string roi_str;
-    std::string cls_name = "3";
+    std::string cls_name = "1";
     std::string codec;
     int imgsz = -1;
     int det_w = -1;
@@ -132,7 +132,7 @@ void print_usage() {
         << "  --cy <double>        Override principal point cy (default calibrated 511.50 on camera)\n"
         << "  --no-undistort       Disable lens undistortion (default enabled for 1280x1024 camera)\n"
         << "  --roi x0,y0,x1,y1    Skip YOLO and use manual box\n"
-        << "  --cls 3|4|7          Character class when using --roi (default 3)\n"
+        << "  --cls 1|3|sentary    Target class when using --roi (default 1)\n"
         << "  --track              Enable temporal Pure-M1 tracking between YOLO keyframes\n"
         << "  --redetect-every <N> YOLO refresh interval in --track mode (default 15)\n"
         << "  --bench <N>          Run N iterations in --image mode to benchmark C++ latency\n\n"

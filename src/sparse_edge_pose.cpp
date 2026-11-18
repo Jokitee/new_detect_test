@@ -593,10 +593,11 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
         }
     }
 
+    const bool solid_target = (tpl.height_mm / std::max(tpl.width_mm, 1e-6)) >= 1.25;
     cv::Mat tight, bin;
     cv::GaussianBlur(roi_seg, tight, cv::Size(3, 3), 0.0);
     cv::threshold(tight, bin, 0, 1, cv::THRESH_BINARY | cv::THRESH_OTSU);
-    if (std::min(bin.rows, bin.cols) >= 16) {
+    if (solid_target && std::min(bin.rows, bin.cols) >= 16) {
         cv::morphologyEx(bin, bin, cv::MORPH_OPEN,
                          cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
     }
@@ -606,16 +607,40 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     cv::findContours(bin, cnts, hier, cv::RETR_CCOMP, cv::CHAIN_APPROX_NONE);
     if (cnts.empty()) return res;
 
-    int k_max = 0;
-    double max_area = 0.0;
+    std::vector<double> areas(cnts.size(), 0.0);
+    auto in_core = [&](const std::vector<cv::Point>& c) {
+        const cv::Rect bb = cv::boundingRect(c);
+        const double mx = bb.x + 0.5 * bb.width;
+        const double my = bb.y + 0.5 * bb.height;
+        return mx >= (in_x0 - 2) && mx <= (in_x1 + 2) &&
+               my >= (in_y0 - 2) && my <= (in_y1 + 2);
+    };
+
+    std::vector<int> top_inner;
     for (size_t i = 0; i < cnts.size(); ++i) {
-        const double a = cv::contourArea(cnts[i]);
-        if (a > max_area) {
-            max_area = a;
-            k_max = static_cast<int>(i);
+        areas[i] = cv::contourArea(cnts[i]);
+        const bool is_top = (hier.size() != cnts.size()) || (hier[i][3] < 0);
+        if (is_top && in_core(cnts[i])) {
+            top_inner.push_back(static_cast<int>(i));
         }
     }
-    if (max_area < 20.0) return res;
+    if (top_inner.empty()) {
+        for (size_t i = 0; i < cnts.size(); ++i) {
+            const bool is_top = (hier.size() != cnts.size()) || (hier[i][3] < 0);
+            if (is_top) top_inner.push_back(static_cast<int>(i));
+        }
+    }
+    if (top_inner.empty()) return res;
+
+    int k_max = top_inner[0];
+    double max_area = areas[k_max];
+    for (int idx : top_inner) {
+        if (areas[idx] > max_area) {
+            max_area = areas[idx];
+            k_max = idx;
+        }
+    }
+    if (max_area < 16.0) return res;
 
     std::vector<cv::Point2d> cnt;
     double min_cx = 1e9, max_cx = -1e9, min_cy = 1e9, max_cy = -1e9;
@@ -630,12 +655,19 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
             max_cy = std::max(max_cy, gy);
         }
     };
-    push_cnt(cnts[k_max]);
-    for (size_t i = 0; i < cnts.size(); ++i) {
-        if (hier[i][3] == k_max && cv::contourArea(cnts[i]) > 0.015 * max_area) {
-            push_cnt(cnts[i]);
+    for (int oi : top_inner) {
+        if (oi == k_max || areas[oi] >= 0.12 * max_area) {
+            push_cnt(cnts[oi]);
+            if (hier.size() == cnts.size()) {
+                for (size_t c = 0; c < cnts.size(); ++c) {
+                    if (hier[c][3] == oi && areas[c] > 0.015 * areas[oi]) {
+                        push_cnt(cnts[c]);
+                    }
+                }
+            }
         }
     }
+    if (cnt.empty()) return res;
 
     // Optimization ROI patch with external LED suppression
     const int x0 = std::max(0, static_cast<int>(std::floor(std::min(bx0, min_cx))) - margin);
@@ -692,8 +724,13 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     const cv::Vec3d t0((cx_c - Kc.cx) * z0 / Kc.fx, (cy_c - Kc.cy) * z0 / Kc.fy, z0);
 
     // Coarse multi-yaw/pitch rotation seeds (no minAreaRect, no IPPE)
-    std::vector<double> rolls{roll_deg};
-    if (std::abs(roll_deg) > 4.0) rolls.push_back(0.0);
+    std::vector<double> rolls;
+    if (solid_target) {
+        rolls.push_back(roll_deg);
+        if (std::abs(roll_deg) > 4.0) rolls.push_back(0.0);
+    } else {
+        rolls = {0.0, -18.0, 18.0};
+    }
 
     std::vector<SeedHyp> scored;
     const std::array<int, 5> yaws{-42, -16, 0, 16, 42};
@@ -722,6 +759,7 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
 
     std::vector<SeedHyp> cands{scored[0]};
     auto add_branch = [&](auto pred) {
+        int added = 0;
         for (const auto& s : scored) {
             if (!pred(s.yaw_deg)) continue;
             bool distinct = true;
@@ -733,7 +771,8 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
             }
             if (distinct) {
                 cands.push_back(s);
-                break;
+                ++added;
+                if (added >= 2 || cands.size() >= 6) break;
             }
         }
     };
@@ -745,11 +784,18 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     cv::GaussianBlur(sub, gs, cv::Size(0, 0), 1.0);
 
     std::vector<RefinedCand> refined;
-    const std::vector<int> radii{6, 4, 3, 2, 2};
+    const double chamfer_gate = std::max(8.0, 0.06 * h_c);
+    const int edge_r0 = std::clamp(static_cast<int>(std::round(0.04 * h_c)), 6, 14);
+    std::vector<int> radii;
+    if (edge_r0 > 6) {
+        radii = {edge_r0, 6, 4, 3, 2};
+    } else {
+        radii = {6, 4, 3, 2};
+    }
     for (const auto& cand : cands) {
         cv::Matx33d R = cand.R;
         cv::Vec3d t = t0;
-        refine_chamfer_gated(dt, dtx, dty, R, t, tpl, Kc, 6, 8.0, 3.0);
+        refine_chamfer_gated(dt, dtx, dty, R, t, tpl, Kc, 8, chamfer_gate, 3.0);
         double med = 0.0, frac = 0.0;
         refine_edges_lie(gs, R, t, tpl, Kc, radii, med, frac, 1.5);
         if (!std::isfinite(med) || !is_finite_pose(R, t)) continue;

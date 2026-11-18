@@ -7,7 +7,7 @@ Pure-M1 character detection & 6DoF pose estimation in C++17 (`IFL-Net V2-Slim 44
 - `xmake.lua` — xmake build script (uses local/system OpenCV by default without downloading; links `MVSDK`, C++17, `fastest`)
 - `include/tav_pose/` — `types.hpp`, `yolo_detector.hpp`, `sparse_edge_pose.hpp`, `mv_camera.hpp`
 - `src/` — `yolo_detector.cpp`, `sparse_edge_pose.cpp`, `mv_camera.cpp`, `main.cpp`
-- `assets/ifl_net_v2_448x336.onnx` — Default 3-scale (`P2+P3+P4`), 3-class (`3`, `4`, `7`) IFL-Net V2-Slim ONNX (`448x336`, `opset=12`)
+- `assets/ifl_net_v2_448x336.onnx` — Default 3-scale (`P2+P3+P4`), 3-class (`1`, `3`, `sentary`) IFL-Net V2-Slim ONNX (`448x336`, `opset=12`)
 - `assets/char3_det_416.onnx` — Optional 3-class YOLOv8n detect ONNX (`416x416`, `opset=12`)
 - `assets/templates.csv` — 64-point 3D planar contour templates with tangents and outward normals
 
