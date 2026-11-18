@@ -180,3 +180,7 @@ target("new_detect_test")
         add_syslinks("pthread")
         add_ldflags("-rdynamic")
     end
+
+if os.isdir("sp_aim") then
+    includes("sp_aim")
+end

@@ -1,0 +1,62 @@
+#####----- sp_aim (IFL-Net V2-Slim + Pure-M1 + 迁移 sp_vision_25 EKF/Aimer/Planner) 测试配置 -----#####
+
+# 1. 目标颜色配置
+enemy_color: "red"                  # "red" | "blue"
+ifl_color_mode: "auto"              # "auto" | "force_enemy" | "red" | "blue"
+ifl_fallback_to_enemy_color: true   # 无灯条黑白靶标回退为 enemy_color
+
+# 2. IFL-Net V2-Slim + Pure-M1（复用 new_detect_test/assets 下模型与 64 点模板）
+ifl_model_path: "assets/ifl_net_v2_448x336.onnx"
+ifl_templates_path: "assets/templates.csv"
+ifl_det_w: 448
+ifl_det_h: 336
+ifl_conf: 0.45
+ifl_nms: 0.45
+ifl_use_gray: true
+ifl_use_undistort: true
+ifl_one_as_big: true
+
+# 3. Pure-M1 几何防误检门控与 EKF Yaw 对接开关
+m1_gate_enable: true
+m1_min_edge_frac: 0.22
+m1_max_edge_med_px: 2.50
+m1_track: false
+m1_redetect_every: 15
+use_optimize_yaw: false             # false=直接使用Pure-M1连续6DoF Yaw; true=开启1deg离散重投影对比
+
+# 4. sp_vision_25 原版 Tracker / 11维 EKF / Aimer / Shooter 参数
+min_detect_count: 5
+max_temp_lost_count: 15
+outpost_max_temp_lost_count: 75
+
+yaw_offset: 0.0
+pitch_offset: 0.0
+comming_angle: 55
+leaving_angle: 20
+decision_speed: 7
+high_speed_delay_time: 0.0
+low_speed_delay_time: 0.0
+
+first_tolerance: 3
+second_tolerance: 2
+judge_distance: 2
+auto_fire: false
+
+# 5. sp_vision_25 TinyMPC Planner 参数（--planner 开启时使用）
+fire_thresh: 0.0035
+max_yaw_acc: 50
+Q_yaw: [9e6, 0]
+R_yaw: [1]
+max_pitch_acc: 100
+Q_pitch: [9e6, 0]
+R_pitch: [1]
+
+# 6. MindVision 1280x1024 标定内参 & 外参（实车标定后请替换 R_camera2gimbal / t_camera2gimbal）
+R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+camera_matrix: [1757.35, 0.0, 639.50, 0.0, 1754.99, 511.50, 0.0, 0.0, 1.0]
+distort_coeffs: [-0.0369, -0.2629, 0.00549, -0.00169, 1.609]
+R_camera2gimbal: [0.0, 0.0, 1.0,
+                 -1.0, 0.0, 0.0,
+                  0.0, -1.0, 0.0]
+t_camera2gimbal: [0.0, 0.0, 0.0]
+
