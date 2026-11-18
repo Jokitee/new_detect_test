@@ -401,7 +401,6 @@ bool MvCamera::try_recover_connection(int last_status, int& reconnect_failures) 
         std::fflush(stdout);
         reconnect_failures = 0;
         grab_err_logs_ = 0;
-    prefer_low_speed_ = false;
         return true;
     }
 
@@ -424,6 +423,11 @@ void MvCamera::capture_loop() {
         if (h_camera_ < 0 || !rgb_buffer_) {
             sleep_interruptible(running_, 300);
             if (!running_.load()) break;
+            if (reconnect_failures > 0 && (reconnect_failures % 3) == 0) {
+                reset_mindvision_usb_linux(dev_sn_, dev_product_);
+                sleep_interruptible(running_, 400);
+                if (!running_.load()) break;
+            }
             if (init_hardware(false, true)) {
                 std::printf("[MvCamera] Camera reconnected.\n");
                 std::fflush(stdout);
@@ -431,7 +435,6 @@ void MvCamera::capture_loop() {
                 reconnect_failures = 0;
                 last_reopen_log = 0;
                 grab_err_logs_ = 0;
-    prefer_low_speed_ = false;
             } else {
                 ++reconnect_failures;
                 if (reconnect_failures == 1 || reconnect_failures - last_reopen_log >= 10) {
