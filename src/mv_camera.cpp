@@ -1,10 +1,21 @@
 #include "tav_pose/mv_camera.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <linux/usbdevice_fs.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
 #include "CameraApi.h"
@@ -18,6 +29,81 @@ void sleep_interruptible(const std::atomic<bool>& running, int total_ms) {
     for (int elapsed = 0; elapsed < total_ms && running.load(); elapsed += kStepMs) {
         std::this_thread::sleep_for(std::chrono::milliseconds(std::min(kStepMs, total_ms - elapsed)));
     }
+}
+
+std::string read_sysfs_trimmed(const std::filesystem::path& p) {
+    std::ifstream ifs(p);
+    if (!ifs.is_open()) return {};
+    std::string s;
+    std::getline(ifs, s);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
+        s.pop_back();
+    }
+    return s;
+}
+
+bool reset_mindvision_usb_linux(const std::string& sn, const std::string& product) {
+#ifdef __linux__
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path usb_root("/sys/bus/usb/devices");
+    if (!fs::exists(usb_root, ec)) return false;
+
+    fs::path matched_dir;
+    fs::path fallback_dir;
+    for (const auto& entry : fs::directory_iterator(usb_root, ec)) {
+        if (ec) break;
+        const fs::path d = entry.path();
+        const std::string bus_s = read_sysfs_trimmed(d / "busnum");
+        const std::string dev_s = read_sysfs_trimmed(d / "devnum");
+        if (bus_s.empty() || dev_s.empty()) continue;
+
+        const std::string sys_sn = read_sysfs_trimmed(d / "serial");
+        if (!sn.empty() && sys_sn == sn) {
+            matched_dir = d;
+            break;
+        }
+        const std::string sys_prod = read_sysfs_trimmed(d / "product");
+        const std::string sys_mfg = read_sysfs_trimmed(d / "manufacturer");
+        if ((!product.empty() && sys_prod.find(product) != std::string::npos) ||
+            sys_mfg.find("MindVision") != std::string::npos ||
+            sys_mfg.find("MINDVISION") != std::string::npos ||
+            sys_prod.find("MV-") != std::string::npos) {
+            fallback_dir = d;
+        }
+    }
+
+    const fs::path target = !matched_dir.empty() ? matched_dir : fallback_dir;
+    if (target.empty()) {
+        std::printf("[MvCamera] USB reset skipped: matching /sys/bus/usb/devices node not found.\n");
+        std::fflush(stdout);
+        return false;
+    }
+
+    const int busnum = std::atoi(read_sysfs_trimmed(target / "busnum").c_str());
+    const int devnum = std::atoi(read_sysfs_trimmed(target / "devnum").c_str());
+    if (busnum <= 0 || devnum <= 0) return false;
+
+    char dev_path[64];
+    std::snprintf(dev_path, sizeof(dev_path), "/dev/bus/usb/%03d/%03d", busnum, devnum);
+    const int fd = ::open(dev_path, O_WRONLY);
+    if (fd < 0) {
+        std::printf("[MvCamera] USB reset open(%s) failed: %s\n", dev_path, std::strerror(errno));
+        std::fflush(stdout);
+        return false;
+    }
+    const int rc = ::ioctl(fd, USBDEVFS_RESET, 0);
+    const int saved_err = errno;
+    ::close(fd);
+    std::printf("[MvCamera] USBDEVFS_RESET(%s) -> rc=%d (%s)\n",
+                dev_path, rc, (rc == 0) ? "OK" : std::strerror(saved_err));
+    std::fflush(stdout);
+    return rc == 0;
+#else
+    (void)sn;
+    (void)product;
+    return false;
+#endif
 }
 
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
@@ -195,6 +281,10 @@ bool MvCamera::init_hardware(bool throw_on_error, bool quiet_enum_fail) {
     if (iCameraCounts == 0) {
         return fail("MindVision camera not found (iCameraCounts == 0).");
     }
+    dev_sn_.assign(tCameraEnumList.acSn,
+                   strnlen(tCameraEnumList.acSn, sizeof(tCameraEnumList.acSn)));
+    dev_product_.assign(tCameraEnumList.acProductName,
+                        strnlen(tCameraEnumList.acProductName, sizeof(tCameraEnumList.acProductName)));
 
     const int init_status = CameraInit(&tCameraEnumList, -1, -1, &h_camera_);
     std::printf("state = %d\n", init_status);
@@ -221,14 +311,29 @@ bool MvCamera::init_hardware(bool throw_on_error, bool quiet_enum_fail) {
 
     mono_sensor_ = (tCapability.sIspCapacity.bMonoSensor != 0);
 
-    // Follow example1.cpp & Catalyst-MDVS: enter CameraPlay before resolution/format calls.
-    const int play_status = CameraPlay(h_camera_);
-    if (play_status != CAMERA_STATUS_SUCCESS) {
-        std::printf("[MvCamera] Warning: CameraPlay status = %d\n", play_status);
+    // Force continuous mode (0) and configure resolution BEFORE CameraPlay so presets/ROI latch cleanly.
+    CameraSetTriggerMode(h_camera_, 0);
+    if (prefer_low_speed_ && tCapability.iFrameSpeedDesc > 1) {
+        const int sp_rc = CameraSetFrameSpeed(h_camera_, 0);
+        if (!quiet_enum_fail) {
+            std::printf("[MvCamera] Safe fallback FrameSpeed=0 (LOW) status = %d\n", sp_rc);
+        }
+    } else if (!quiet_enum_fail) {
+        int cur_sp = -1;
+        if (CameraGetFrameSpeed(h_camera_, &cur_sp) == CAMERA_STATUS_SUCCESS) {
+            std::printf("[MvCamera] FrameSpeed index = %d / %d\n",
+                        cur_sp, tCapability.iFrameSpeedDesc);
+        }
     }
 
     apply_requested_resolution(h_camera_, tCapability, req_width_, req_height_,
                                max_width_, max_height_, !quiet_enum_fail);
+
+    CameraClearBuffer(h_camera_);
+    const int play_status = CameraPlay(h_camera_);
+    if (play_status != CAMERA_STATUS_SUCCESS) {
+        std::printf("[MvCamera] Warning: CameraPlay status = %d\n", play_status);
+    }
 
     const MvResolutionInfo info = query_active_resolution(h_camera_, !quiet_enum_fail);
     {
@@ -261,13 +366,16 @@ bool MvCamera::try_recover_connection(int last_status, int& reconnect_failures) 
             std::fflush(stdout);
             if (rec_status == CAMERA_STATUS_SUCCESS &&
                 CameraConnectTest(h_camera_) == CAMERA_STATUS_SUCCESS) {
-                CameraPlay(h_camera_);
+                CameraPause(h_camera_);
+                CameraSetTriggerMode(h_camera_, 0);
                 tSdkCameraCapbility cap{};
                 if (req_width_ > 0 && req_height_ > 0 &&
                     CameraGetCapability(h_camera_, &cap) == CAMERA_STATUS_SUCCESS) {
                     apply_requested_resolution(h_camera_, cap, req_width_, req_height_,
                                                max_width_, max_height_, false);
                 }
+                CameraClearBuffer(h_camera_);
+                CameraPlay(h_camera_);
                 const MvResolutionInfo info = query_active_resolution(h_camera_, false);
                 {
                     std::lock_guard<std::mutex> lk(frame_mutex_);
@@ -280,17 +388,20 @@ bool MvCamera::try_recover_connection(int last_status, int& reconnect_failures) 
         }
     }
 
-    std::printf("[MvCamera] Re-enumerating & reopening camera...\n");
+    std::printf("[MvCamera] Resetting USB & reopening camera (switching to safe LOW USB speed)...\n");
     std::fflush(stdout);
+    prefer_low_speed_ = true;
     close_hardware();
-    sleep_interruptible(running_, 250);
+    reset_mindvision_usb_linux(dev_sn_, dev_product_);
+    sleep_interruptible(running_, 600);
     if (!running_.load()) return false;
 
     if (init_hardware(false, true)) {
-        std::printf("[MvCamera] Camera recovered via full reopen.\n");
+        std::printf("[MvCamera] Camera recovered via USB reset + full reopen.\n");
         std::fflush(stdout);
         reconnect_failures = 0;
         grab_err_logs_ = 0;
+    prefer_low_speed_ = false;
         return true;
     }
 
@@ -320,6 +431,7 @@ void MvCamera::capture_loop() {
                 reconnect_failures = 0;
                 last_reopen_log = 0;
                 grab_err_logs_ = 0;
+    prefer_low_speed_ = false;
             } else {
                 ++reconnect_failures;
                 if (reconnect_failures == 1 || reconnect_failures - last_reopen_log >= 10) {
@@ -334,7 +446,7 @@ void MvCamera::capture_loop() {
 
         tSdkFrameHead sFrameInfo{};
         BYTE* pbyBuffer = nullptr;
-        const int get_status = CameraGetImageBuffer(h_camera_, &sFrameInfo, &pbyBuffer, 150);
+        const int get_status = CameraGetImageBuffer(h_camera_, &sFrameInfo, &pbyBuffer, 250);
         if (get_status != CAMERA_STATUS_SUCCESS || pbyBuffer == nullptr) {
             if (!running_.load()) break;
             const bool hard_drop = (get_status != CAMERA_STATUS_TIME_OUT);
@@ -385,6 +497,7 @@ void MvCamera::open(double exposure_us, int req_width, int req_height) {
     req_width_ = req_width;
     req_height_ = req_height;
     grab_err_logs_ = 0;
+    prefer_low_speed_ = false;
     {
         std::lock_guard<std::mutex> lk(frame_mutex_);
         latest_frame_.release();
@@ -433,6 +546,7 @@ void MvCamera::close_hardware() {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
     if (h_camera_ >= 0) {
         CameraPause(h_camera_);
+        CameraStop(h_camera_);
         CameraUnInit(h_camera_);
         h_camera_ = -1;
     }

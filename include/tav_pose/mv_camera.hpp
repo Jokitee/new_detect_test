@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include <opencv2/core.hpp>
@@ -50,9 +51,12 @@ private:
     int max_height_ = 0;
     int grab_err_logs_ = 0;
     bool mono_sensor_ = false;
+    bool prefer_low_speed_ = false;
     double req_exposure_us_ = 8000.0;
     int req_width_ = 640;
     int req_height_ = 480;
+    std::string dev_sn_;
+    std::string dev_product_;
     unsigned char* rgb_buffer_ = nullptr;
 
     mutable std::mutex frame_mutex_;
