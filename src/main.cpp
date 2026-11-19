@@ -104,12 +104,11 @@ struct Args {
     bool downsample = true;       // 640x480 -> 448x336 (0.7x INTER_AREA, no crop)
     int stream_w = 448;
     int stream_h = 336;
-    double fps = 0.0;       // 0 -> auto (30.0 for camera, source FPS for video)
+    double fps = 60.0;       // 0 -> auto (30.0 for camera, source FPS for video)
     int max_frames = 0;     // 0 -> unlimited
     bool track = false;
     int redetect_every = 15;
     int max_targets = 0;    // <= 0 -> solve all detections (in parallel); > 0 -> cap top-K
-    double vis_gain = 1.0;  // Manual display brightness gain (default 1.0 = raw image, no auto change)
     int threads = 0;        // > 0 -> cv::setNumThreads(threads)
 };
 
@@ -151,7 +150,6 @@ void print_usage() {
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
         << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
         << "  --max-frames <N>     Optional frame limit (default 0 = unlimited until Ctrl+C/q/ESC)\n"
-        << "  --vis-gain <double>  Manual display brightness gain (default 1.0 = raw image)\n"
         << "  --threads <int>      Optional cv::setNumThreads(N) (e.g. 1 if VM OpenCV hangs)\n"
         << "  --show               Display cv::imshow window (already enabled by default in camera/video mode)\n"
         << "  --no-show            Disable cv::imshow window (headless recording)\n";
@@ -202,7 +200,6 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--track") a.track = true;
         else if (k == "--redetect-every") a.redetect_every = std::max(1, std::stoi(next()));
         else if (k == "--max-targets") a.max_targets = std::max(0, std::stoi(next()));
-        else if (k == "--vis-gain") a.vis_gain = std::stod(next());
         else if (k == "--threads") a.threads = std::max(1, std::stoi(next()));
         else if (k == "--bgr") a.use_bgr = true;
         else if (k == "--show") a.force_show = true;
@@ -425,11 +422,7 @@ FrameMetrics process_frame(const cv::Mat& frame,
         vis_bgr = frame;
     }
 
-    if (args.vis_gain > 0.0 && std::abs(args.vis_gain - 1.0) > 1e-6) {
-        vis_bgr.convertTo(vis_out, -1, args.vis_gain, 0.0);
-    } else {
-        vis_bgr.copyTo(vis_out);
-    }
+    vis_bgr.copyTo(vis_out);
 
     for (const auto& item : metrics.targets) {
         if (!item.pose.valid || !item.tpl) continue;

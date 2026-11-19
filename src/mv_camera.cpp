@@ -243,7 +243,6 @@ void MvCamera::configure_hardware(bool is_mono_sensor) {
     const int ae_stat = CameraSetAeState(h_camera_, FALSE);
     const int wb_stat = CameraSetWbMode(h_camera_, FALSE);
     const int exp_stat = CameraSetExposureTime(h_camera_, req_exposure_us_);
-    const int gain_stat = CameraSetGain(h_camera_, 100, 70, 50);
 
     if (is_mono_sensor) {
         CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_MONO8);
@@ -257,9 +256,9 @@ void MvCamera::configure_hardware(bool is_mono_sensor) {
     CameraGetAeState(h_camera_, &ae_now);
     CameraGetWbMode(h_camera_, &wb_now);
     CameraGetExposureTime(h_camera_, &exp_now);
-    std::printf("[MvCamera] Manual lock: ae_rc=%d(ae=%d) wb_rc=%d(wb_auto=%d) exp_rc=%d(req=%.1fus actual=%.1fus) gain_rc=%d\n",
+    std::printf("[MvCamera] Manual lock: ae_rc=%d(ae=%d) wb_rc=%d(wb_auto=%d) exp_rc=%d(req=%.1fus actual=%.1fus)\n",
                 ae_stat, static_cast<int>(ae_now), wb_stat, static_cast<int>(wb_now),
-                exp_stat, req_exposure_us_, exp_now, gain_stat);
+                exp_stat, req_exposure_us_, exp_now);
     std::fflush(stdout);
 #else
     (void)is_mono_sensor;
