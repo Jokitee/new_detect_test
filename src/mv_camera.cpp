@@ -240,16 +240,26 @@ MvResolutionInfo MvCamera::resolution_info() const {
 
 void MvCamera::configure_hardware(bool is_mono_sensor) {
 #if defined(TAV_WITH_MVSDK) && TAV_WITH_MVSDK
-    CameraSetAeState(h_camera_, false);
-    const int set_stat = CameraSetExposureTime(h_camera_, req_exposure_us_);
-    CameraSetGain(h_camera_, 100, 70, 50);
-    std::printf("statue = %d\n", set_stat);
+    const int ae_stat = CameraSetAeState(h_camera_, FALSE);
+    const int wb_stat = CameraSetWbMode(h_camera_, FALSE);
+    const int exp_stat = CameraSetExposureTime(h_camera_, req_exposure_us_);
+    const int gain_stat = CameraSetGain(h_camera_, 100, 70, 50);
 
     if (is_mono_sensor) {
         CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_MONO8);
     } else {
         CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_BGR8);
     }
+
+    BOOL ae_now = TRUE;
+    BOOL wb_now = TRUE;
+    double exp_now = -1.0;
+    CameraGetAeState(h_camera_, &ae_now);
+    CameraGetWbMode(h_camera_, &wb_now);
+    CameraGetExposureTime(h_camera_, &exp_now);
+    std::printf("[MvCamera] Manual lock: ae_rc=%d(ae=%d) wb_rc=%d(wb_auto=%d) exp_rc=%d(req=%.1fus actual=%.1fus) gain_rc=%d\n",
+                ae_stat, static_cast<int>(ae_now), wb_stat, static_cast<int>(wb_now),
+                exp_stat, req_exposure_us_, exp_now, gain_stat);
     std::fflush(stdout);
 #else
     (void)is_mono_sensor;
@@ -329,6 +339,9 @@ bool MvCamera::init_hardware(bool throw_on_error, bool quiet_enum_fail) {
     apply_requested_resolution(h_camera_, tCapability, req_width_, req_height_,
                                max_width_, max_height_, !quiet_enum_fail);
 
+    // Disable AE/AWB and lock manual exposure/gain/format BEFORE CameraPlay.
+    configure_hardware(mono_sensor_);
+
     CameraClearBuffer(h_camera_);
     const int play_status = CameraPlay(h_camera_);
     if (play_status != CAMERA_STATUS_SUCCESS) {
@@ -341,7 +354,6 @@ bool MvCamera::init_hardware(bool throw_on_error, bool quiet_enum_fail) {
         res_info_ = info;
     }
 
-    configure_hardware(mono_sensor_);
     return true;
 #else
     (void)throw_on_error;
@@ -374,6 +386,7 @@ bool MvCamera::try_recover_connection(int last_status, int& reconnect_failures) 
                     apply_requested_resolution(h_camera_, cap, req_width_, req_height_,
                                                max_width_, max_height_, false);
                 }
+                configure_hardware(mono_sensor_);
                 CameraClearBuffer(h_camera_);
                 CameraPlay(h_camera_);
                 const MvResolutionInfo info = query_active_resolution(h_camera_, false);
@@ -381,7 +394,6 @@ bool MvCamera::try_recover_connection(int last_status, int& reconnect_failures) 
                     std::lock_guard<std::mutex> lk(frame_mutex_);
                     res_info_ = info;
                 }
-                configure_hardware(mono_sensor_);
                 ++reconnect_failures;
                 return true;
             }

@@ -47,10 +47,6 @@ inline void draw_and_plot_ekf(cv::Mat& canvas,
                               const auto_aim::Aimer& aimer,
                               const tav_pose::CameraIntrinsics* active_K,
                               tools::Plotter* plotter) {
-    if (cv::mean(canvas)[0] < 45.0) {
-        canvas.convertTo(canvas, -1, 2.2, 6.0);
-    }
-
     for (const auto& item : armors) {
         const auto& a = item.armor;
         tools::draw_points(canvas, a.points, {255, 220, 0}, 2);

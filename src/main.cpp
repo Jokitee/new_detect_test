@@ -109,7 +109,7 @@ struct Args {
     bool track = false;
     int redetect_every = 15;
     int max_targets = 0;    // <= 0 -> solve all detections (in parallel); > 0 -> cap top-K
-    double vis_gain = 0.0;  // <= 0 -> auto brightness boost on dark frames
+    double vis_gain = 1.0;  // Manual display brightness gain (default 1.0 = raw image, no auto change)
     int threads = 0;        // > 0 -> cv::setNumThreads(threads)
 };
 
@@ -151,7 +151,7 @@ void print_usage() {
         << "  --fps <double>       Output video FPS (default 30.0 for camera, source FPS for video)\n"
         << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
         << "  --max-frames <N>     Optional frame limit (default 0 = unlimited until Ctrl+C/q/ESC)\n"
-        << "  --vis-gain <double>  Display brightness gain (<=0 = auto 3x on dark frames)\n"
+        << "  --vis-gain <double>  Manual display brightness gain (default 1.0 = raw image)\n"
         << "  --threads <int>      Optional cv::setNumThreads(N) (e.g. 1 if VM OpenCV hangs)\n"
         << "  --show               Display cv::imshow window (already enabled by default in camera/video mode)\n"
         << "  --no-show            Disable cv::imshow window (headless recording)\n";
@@ -425,10 +425,11 @@ FrameMetrics process_frame(const cv::Mat& frame,
         vis_bgr = frame;
     }
 
-    const double gain = (args.vis_gain > 0.0)
-                            ? args.vis_gain
-                            : ((cv::mean(gray)[0] < 60.0) ? 3.0 : 1.0);
-    vis_bgr.convertTo(vis_out, -1, gain, 0.0);
+    if (args.vis_gain > 0.0 && std::abs(args.vis_gain - 1.0) > 1e-6) {
+        vis_bgr.convertTo(vis_out, -1, args.vis_gain, 0.0);
+    } else {
+        vis_bgr.copyTo(vis_out);
+    }
 
     for (const auto& item : metrics.targets) {
         if (!item.pose.valid || !item.tpl) continue;
