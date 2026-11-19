@@ -42,10 +42,76 @@ cv::Vec3d mat_to_rvec(const cv::Matx33d& R) {
     return rvec;
 }
 
-cv::Matx33d rvec_to_mat(const cv::Vec3d& rvec) {
-    cv::Mat R;
-    cv::Rodrigues(rvec, R);
-    return cv::Matx33d(R);
+inline cv::Matx33d exp_so3(double wx, double wy, double wz) {
+    // Closed-form SO(3) Rodrigues exponential map without cv::Mat allocations.
+    const double th2 = wx * wx + wy * wy + wz * wz;
+    double c1, c2;
+    if (th2 < 1e-8) {
+        c1 = 1.0 - th2 * (1.0 / 6.0);
+        c2 = 0.5 - th2 * (1.0 / 24.0);
+    } else {
+        const double th = std::sqrt(th2);
+        c1 = std::sin(th) / th;
+        c2 = (1.0 - std::cos(th)) / th2;
+    }
+    return cv::Matx33d(
+        1.0 - c2 * (wy * wy + wz * wz), -c1 * wz + c2 * wx * wy,        c1 * wy + c2 * wx * wz,
+        c1 * wz + c2 * wx * wy,         1.0 - c2 * (wx * wx + wz * wz), -c1 * wx + c2 * wy * wz,
+        -c1 * wy + c2 * wx * wz,        c1 * wx + c2 * wy * wz,         1.0 - c2 * (wx * wx + wy * wy));
+}
+
+inline double mat_yaw_deg(const cv::Matx33d& R) {
+    return rad2deg(std::asin(std::clamp(R(0, 2), -1.0, 1.0)));
+}
+
+inline double est_pixel_step(const cv::Vec6d& dx, double r_mm, double tz, const CameraIntrinsics& K) {
+    const double f = 0.5 * (K.fx + K.fy);
+    const double inv_z = 1.0 / std::max(std::abs(tz), 1e-3);
+    const double w_norm = std::sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
+    const double rot_px = w_norm * f * r_mm * inv_z;
+    const double trans_xy_px = (std::abs(dx[3]) * K.fx + std::abs(dx[4]) * K.fy) * inv_z;
+    const double trans_z_px = std::abs(dx[5]) * f * r_mm * (inv_z * inv_z);
+    return rot_px + trans_xy_px + trans_z_px;
+}
+
+inline void sample_chamfer_triplet(const cv::Mat& dt,
+                                   const cv::Mat& dtx,
+                                   const cv::Mat& dty,
+                                   float x,
+                                   float y,
+                                   double& d_out,
+                                   double& gx_out,
+                                   double& gy_out) {
+    if (!std::isfinite(x) || !std::isfinite(y) || dt.empty()) {
+        d_out = gx_out = gy_out = 0.0;
+        return;
+    }
+    const int w = dt.cols;
+    const int h = dt.rows;
+    const float xc = std::clamp(x, 0.0f, static_cast<float>(w - 1));
+    const float yc = std::clamp(y, 0.0f, static_cast<float>(h - 1));
+    const int x0 = static_cast<int>(std::floor(xc));
+    const int y0 = static_cast<int>(std::floor(yc));
+    const int x1 = std::min(x0 + 1, w - 1);
+    const int y1 = std::min(y0 + 1, h - 1);
+    const float fx = xc - x0;
+    const float fy = yc - y0;
+    const float w00 = (1.0f - fx) * (1.0f - fy);
+    const float w10 = fx * (1.0f - fy);
+    const float w01 = (1.0f - fx) * fy;
+    const float w11 = fx * fy;
+
+    const float* d0 = dt.ptr<float>(y0);
+    const float* d1 = dt.ptr<float>(y1);
+    d_out = w00 * d0[x0] + w10 * d0[x1] + w01 * d1[x0] + w11 * d1[x1];
+
+    const float* x0r = dtx.ptr<float>(y0);
+    const float* x1r = dtx.ptr<float>(y1);
+    gx_out = w00 * x0r[x0] + w10 * x0r[x1] + w01 * x1r[x0] + w11 * x1r[x1];
+
+    const float* y0r = dty.ptr<float>(y0);
+    const float* y1r = dty.ptr<float>(y1);
+    gy_out = w00 * y0r[x0] + w10 * y0r[x1] + w01 * y1r[x0] + w11 * y1r[x1];
 }
 
 double rot_err_deg(const cv::Matx33d& R1, const cv::Matx33d& R2) {
@@ -206,6 +272,72 @@ struct EdgeSearchScratch {
     int n_valid = 0;
 };
 
+struct SolverWorkspace {
+    std::vector<cv::Point2d> uv;
+    std::vector<cv::Point2d> n_img;
+    std::vector<cv::Vec3d> pr;
+    std::vector<double> X, Y, iz;
+    std::vector<double> ds, gxs, gys;
+    std::vector<double> abs_e;
+    EdgeSearchScratch es;
+
+    void reserve(size_t n) {
+        uv.resize(n);
+        n_img.resize(n);
+        pr.resize(n);
+        X.resize(n);
+        Y.resize(n);
+        iz.resize(n);
+        ds.resize(n);
+        gxs.resize(n);
+        gys.resize(n);
+        abs_e.reserve(n);
+    }
+};
+
+inline void accum_scalar_triple_eq(double px_r,
+                                   double py_r,
+                                   double pz_r,
+                                   double X,
+                                   double Y,
+                                   double iz,
+                                   double nx,
+                                   double ny,
+                                   const CameraIntrinsics& K,
+                                   double residual,
+                                   double weight,
+                                   cv::Matx66d& H,
+                                   cv::Vec6d& g) {
+    // Scalar normal Jacobian via triple product: n^T J_pi (domega x Pr + dt) = [Pr x g, g] * [domega; dt].
+    const double alpha = K.fx * nx * iz;
+    const double beta = K.fy * ny * iz;
+    const double gamma = -(alpha * X + beta * Y) * iz;
+    const double Jr[6] = {
+        py_r * gamma - pz_r * beta,
+        pz_r * alpha - px_r * gamma,
+        px_r * beta - py_r * alpha,
+        alpha,
+        beta,
+        gamma,
+    };
+    const double wr = weight * residual;
+    for (int r = 0; r < 6; ++r) {
+        g[r] += wr * Jr[r];
+        const double wjr = weight * Jr[r];
+        for (int c = r; c < 6; ++c) {
+            H(r, c) += wjr * Jr[c];
+        }
+    }
+}
+
+inline void mirror_upper_sym_6x6(cv::Matx66d& H) {
+    for (int r = 1; r < 6; ++r) {
+        for (int c = 0; c < r; ++c) {
+            H(r, c) = H(c, r);
+        }
+    }
+}
+
 void edge_search(const cv::Mat& gs,
                  const std::vector<cv::Point2d>& pts_img,
                  const std::vector<cv::Point2d>& n_img,
@@ -279,17 +411,52 @@ void edge_search(const cv::Mat& gs,
     }
 }
 
-void project_with_lie_jac(const CharTemplate& tpl,
-                          const cv::Matx33d& R,
-                          const cv::Vec3d& t,
-                          const CameraIntrinsics& K,
-                          std::vector<cv::Point2d>& uv,
-                          std::vector<cv::Point2d>& n_img,
-                          std::vector<cv::Matx<double, 2, 6>>& J) {
+void project_points_chamfer(const CharTemplate& tpl,
+                            const cv::Matx33d& R,
+                            const cv::Vec3d& t,
+                            const CameraIntrinsics& K,
+                            SolverWorkspace& ws) {
     const size_t N = tpl.points.size();
-    uv.resize(N);
-    n_img.resize(N);
-    J.resize(N);
+    ws.uv.resize(N);
+    ws.pr.resize(N);
+    ws.X.resize(N);
+    ws.Y.resize(N);
+    ws.iz.resize(N);
+
+    for (size_t i = 0; i < N; ++i) {
+        const auto& mp = tpl.points[i];
+        const double px_r = R(0, 0) * mp.px + R(0, 1) * mp.py;
+        const double py_r = R(1, 0) * mp.px + R(1, 1) * mp.py;
+        const double pz_r = R(2, 0) * mp.px + R(2, 1) * mp.py;
+
+        const double X = px_r + t[0];
+        const double Y = py_r + t[1];
+        const double Z = std::max(pz_r + t[2], 1e-6);
+        const double iz = 1.0 / Z;
+
+        ws.pr[i] = cv::Vec3d(px_r, py_r, pz_r);
+        ws.X[i] = X;
+        ws.Y[i] = Y;
+        ws.iz[i] = iz;
+        ws.uv[i] = cv::Point2d(K.fx * X * iz + K.cx, K.fy * Y * iz + K.cy);
+    }
+}
+
+void project_points_and_normals(const CharTemplate& tpl,
+                                const cv::Matx33d& R,
+                                const cv::Vec3d& t,
+                                const CameraIntrinsics& K,
+                                SolverWorkspace& ws,
+                                bool need_jac_state) {
+    const size_t N = tpl.points.size();
+    ws.uv.resize(N);
+    ws.n_img.resize(N);
+    if (need_jac_state) {
+        ws.pr.resize(N);
+        ws.X.resize(N);
+        ws.Y.resize(N);
+        ws.iz.resize(N);
+    }
 
     for (size_t i = 0; i < N; ++i) {
         const auto& mp = tpl.points[i];
@@ -303,30 +470,19 @@ void project_with_lie_jac(const CharTemplate& tpl,
         const double iz = 1.0 / Z;
         const double iz2 = iz * iz;
 
-        uv[i] = cv::Point2d(K.fx * X * iz + K.cx, K.fy * Y * iz + K.cy);
+        ws.uv[i] = cv::Point2d(K.fx * X * iz + K.cx, K.fy * Y * iz + K.cy);
+        if (need_jac_state) {
+            ws.pr[i] = cv::Vec3d(px_r, py_r, pz_r);
+            ws.X[i] = X;
+            ws.Y[i] = Y;
+            ws.iz[i] = iz;
+        }
 
         const double fx_iz = K.fx * iz;
         const double fy_iz = K.fy * iz;
         const double fx_X_iz2 = -K.fx * X * iz2;
         const double fy_Y_iz2 = -K.fy * Y * iz2;
 
-        // SE(3) left-perturbation Jacobian: dPc = domega x Pr + dt
-        cv::Matx<double, 2, 6>& Ji = J[i];
-        Ji(0, 0) = fx_X_iz2 * py_r;
-        Ji(0, 1) = fx_iz * pz_r - fx_X_iz2 * px_r;
-        Ji(0, 2) = -fx_iz * py_r;
-        Ji(0, 3) = fx_iz;
-        Ji(0, 4) = 0.0;
-        Ji(0, 5) = fx_X_iz2;
-
-        Ji(1, 0) = -fy_iz * pz_r + fy_Y_iz2 * py_r;
-        Ji(1, 1) = -fy_Y_iz2 * px_r;
-        Ji(1, 2) = fy_iz * px_r;
-        Ji(1, 3) = 0.0;
-        Ji(1, 4) = fy_iz;
-        Ji(1, 5) = fy_Y_iz2;
-
-        // Analytical tangent -> outward image normal
         const double tcx = R(0, 0) * mp.tx + R(0, 1) * mp.ty;
         const double tcy = R(1, 0) * mp.tx + R(1, 1) * mp.ty;
         const double tcz = R(2, 0) * mp.tx + R(2, 1) * mp.ty;
@@ -345,7 +501,7 @@ void project_with_lie_jac(const CharTemplate& tpl,
             nix = -nix;
             niy = -niy;
         }
-        n_img[i] = cv::Point2d(nix, niy);
+        ws.n_img[i] = cv::Point2d(nix, niy);
     }
 }
 
@@ -353,7 +509,7 @@ bool apply_lie_step(cv::Matx33d& R, cv::Vec3d& t, const cv::Vec6d& dx) {
     for (int k = 0; k < 6; ++k) {
         if (!std::isfinite(dx[k])) return false;
     }
-    const cv::Matx33d R_next = rvec_to_mat(cv::Vec3d(dx[0], dx[1], dx[2])) * R;
+    const cv::Matx33d R_next = exp_so3(dx[0], dx[1], dx[2]) * R;
     const cv::Vec3d t_next = t + cv::Vec3d(dx[3], dx[4], dx[5]);
     if (!is_finite_pose(R_next, t_next)) return false;
     R = R_next;
@@ -361,51 +517,53 @@ bool apply_lie_step(cv::Matx33d& R, cv::Vec3d& t, const cv::Vec6d& dx) {
     return true;
 }
 
-void refine_chamfer_gated(const cv::Mat& dt,
-                          const cv::Mat& dtx,
-                          const cv::Mat& dty,
-                          cv::Matx33d& R,
-                          cv::Vec3d& t,
-                          const CharTemplate& tpl,
-                          const CameraIntrinsics& K,
-                          int iters = 6,
-                          double gate = 8.0,
-                          double huber = 3.0) {
-    std::vector<cv::Point2d> uv, n_dummy;
-    std::vector<cv::Matx<double, 2, 6>> J;
+double refine_chamfer_gated(const cv::Mat& dt,
+                            const cv::Mat& dtx,
+                            const cv::Mat& dty,
+                            cv::Matx33d& R,
+                            cv::Vec3d& t,
+                            const CharTemplate& tpl,
+                            const CameraIntrinsics& K,
+                            SolverWorkspace& ws,
+                            double r_mm,
+                            int iters = 5,
+                            double gate = 8.0,
+                            double huber = 3.0) {
     const size_t N = tpl.points.size();
-    std::vector<double> ds(N), gxs(N), gys(N);
+    ws.ds.resize(N);
+    ws.gxs.resize(N);
+    ws.gys.resize(N);
 
     for (int it = 0; it < iters; ++it) {
-        project_with_lie_jac(tpl, R, t, K, uv, n_dummy, J);
+        project_points_chamfer(tpl, R, t, K, ws);
         int vis_cnt = 0;
+        double sum_all = 0.0;
+        double sum_vis = 0.0;
         for (size_t i = 0; i < N; ++i) {
-            const float x = static_cast<float>(uv[i].x);
-            const float y = static_cast<float>(uv[i].y);
-            ds[i] = sample_bilinear_f32(dt, x, y);
-            gxs[i] = sample_bilinear_f32(dtx, x, y);
-            gys[i] = sample_bilinear_f32(dty, x, y);
-            if (ds[i] <= gate) ++vis_cnt;
+            sample_chamfer_triplet(dt, dtx, dty,
+                                   static_cast<float>(ws.uv[i].x),
+                                   static_cast<float>(ws.uv[i].y),
+                                   ws.ds[i], ws.gxs[i], ws.gys[i]);
+            sum_all += ws.ds[i];
+            if (ws.ds[i] <= gate) {
+                ++vis_cnt;
+                sum_vis += ws.ds[i];
+            }
         }
         const bool use_gate = (vis_cnt >= 12);
+        const double mean_d = use_gate ? (sum_vis / vis_cnt) : (sum_all / std::max<size_t>(N, 1));
 
         cv::Matx66d H = cv::Matx66d::zeros();
         cv::Vec6d g = cv::Vec6d::zeros();
         for (size_t i = 0; i < N; ++i) {
-            if (use_gate && ds[i] > gate) continue;
-            const double d = ds[i];
+            if (use_gate && ws.ds[i] > gate) continue;
+            const double d = ws.ds[i];
             const double w = (d <= huber) ? 1.0 : huber / std::max(d, 1e-9);
-            double Jr[6];
-            for (int c = 0; c < 6; ++c) {
-                Jr[c] = gxs[i] * J[i](0, c) + gys[i] * J[i](1, c);
-            }
-            for (int r = 0; r < 6; ++r) {
-                g[r] += w * Jr[r] * d;
-                for (int c = 0; c < 6; ++c) {
-                    H(r, c) += w * Jr[r] * Jr[c];
-                }
-            }
+            accum_scalar_triple_eq(ws.pr[i][0], ws.pr[i][1], ws.pr[i][2],
+                                   ws.X[i], ws.Y[i], ws.iz[i],
+                                   ws.gxs[i], ws.gys[i], K, d, w, H, g);
         }
+        mirror_upper_sym_6x6(H);
         double tr = 0.0;
         for (int k = 0; k < 6; ++k) tr += H(k, k);
         const double damp = 1e-3 * tr / 6.0 + 1e-9;
@@ -413,12 +571,23 @@ void refine_chamfer_gated(const cv::Mat& dt,
 
         cv::Vec6d dx;
         if (!solve_6x6(H, g, dx)) break;
+        // 0.7x damping inside the Chamfer crease avoids V-valley period-2 limit cycles.
+        if (mean_d < 1.2) {
+            for (int k = 0; k < 6; ++k) dx[k] *= 0.7;
+        }
         if (!apply_lie_step(R, t, dx)) break;
-
-        double max_step = 0.0;
-        for (int k = 0; k < 6; ++k) max_step = std::max(max_step, std::abs(dx[k]));
-        if (max_step < 2e-4) break;
+        if (est_pixel_step(dx, r_mm, t[2], K) < 0.05) break;
     }
+
+    // Final truncated Chamfer residual score for post-Chamfer branch deduplication
+    project_points_chamfer(tpl, R, t, K, ws);
+    double sum_trunc = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+        const double d = static_cast<double>(sample_bilinear_f32(
+            dt, static_cast<float>(ws.uv[i].x), static_cast<float>(ws.uv[i].y)));
+        sum_trunc += std::min(d, gate);
+    }
+    return sum_trunc / std::max<size_t>(N, 1);
 }
 
 void refine_edges_lie(const cv::Mat& gs,
@@ -427,44 +596,35 @@ void refine_edges_lie(const cv::Mat& gs,
                       const CharTemplate& tpl,
                       const CameraIntrinsics& K,
                       const std::vector<int>& radii,
+                      SolverWorkspace& ws,
+                      double r_mm,
                       double& out_med,
                       double& out_frac,
                       double huber = 1.5) {
     out_med = std::numeric_limits<double>::quiet_NaN();
     out_frac = 0.0;
     const int min_valid = std::min(12, std::max(6, static_cast<int>(tpl.points.size()) / 2));
-    std::vector<cv::Point2d> uv, n_img;
-    std::vector<cv::Matx<double, 2, 6>> J;
-    EdgeSearchScratch es;
-    std::vector<double> abs_e;
 
     for (int rad : radii) {
-        project_with_lie_jac(tpl, R, t, K, uv, n_img, J);
-        edge_search(gs, uv, n_img, rad, es);
-        if (es.n_valid < min_valid) break;
+        project_points_and_normals(tpl, R, t, K, ws, true);
+        edge_search(gs, ws.uv, ws.n_img, rad, ws.es);
+        if (ws.es.n_valid < min_valid) break;
 
         cv::Matx66d H = cv::Matx66d::zeros();
         cv::Vec6d g = cv::Vec6d::zeros();
-        abs_e.clear();
-        abs_e.reserve(es.n_valid);
+        ws.abs_e.clear();
 
         for (size_t i = 0; i < tpl.points.size(); ++i) {
-            if (!es.valid[i]) continue;
-            const double e = -es.off[i];
+            if (!ws.es.valid[i]) continue;
+            const double e = -ws.es.off[i];
             const double ae = std::abs(e);
-            abs_e.push_back(ae);
+            ws.abs_e.push_back(ae);
             const double w = (ae <= huber) ? 1.0 : huber / std::max(ae, 1e-9);
-            double Jr[6];
-            for (int c = 0; c < 6; ++c) {
-                Jr[c] = n_img[i].x * J[i](0, c) + n_img[i].y * J[i](1, c);
-            }
-            for (int r = 0; r < 6; ++r) {
-                g[r] += w * Jr[r] * e;
-                for (int c = 0; c < 6; ++c) {
-                    H(r, c) += w * Jr[r] * Jr[c];
-                }
-            }
+            accum_scalar_triple_eq(ws.pr[i][0], ws.pr[i][1], ws.pr[i][2],
+                                   ws.X[i], ws.Y[i], ws.iz[i],
+                                   ws.n_img[i].x, ws.n_img[i].y, K, e, w, H, g);
         }
+        mirror_upper_sym_6x6(H);
         double tr = 0.0;
         for (int k = 0; k < 6; ++k) tr += H(k, k);
         const double damp = 1e-6 * tr / 6.0 + 1e-12;
@@ -474,11 +634,12 @@ void refine_edges_lie(const cv::Mat& gs,
         if (!solve_6x6(H, g, dx)) break;
         if (!apply_lie_step(R, t, dx)) break;
 
-        if (!abs_e.empty()) {
-            std::nth_element(abs_e.begin(), abs_e.begin() + abs_e.size() / 2, abs_e.end());
-            out_med = abs_e[abs_e.size() / 2];
+        if (!ws.abs_e.empty()) {
+            std::nth_element(ws.abs_e.begin(), ws.abs_e.begin() + ws.abs_e.size() / 2, ws.abs_e.end());
+            out_med = ws.abs_e[ws.abs_e.size() / 2];
         }
-        out_frac = static_cast<double>(es.n_valid) / static_cast<double>(tpl.points.size());
+        out_frac = static_cast<double>(ws.es.n_valid) / static_cast<double>(tpl.points.size());
+        if (rad <= 3 && est_pixel_step(dx, r_mm, t[2], K) < 0.04) break;
     }
 }
 
@@ -486,25 +647,30 @@ double boundary_phot_contrast(const cv::Mat& gs,
                                 const CharTemplate& tpl,
                                 const cv::Matx33d& R,
                                 const cv::Vec3d& t,
-                                const CameraIntrinsics& K) {
-    std::vector<cv::Point2d> uv, n_img;
-    std::vector<cv::Matx<double, 2, 6>> J;
-    project_with_lie_jac(tpl, R, t, K, uv, n_img, J);
+                                const CameraIntrinsics& K,
+                                SolverWorkspace& ws) {
+    project_points_and_normals(tpl, R, t, K, ws, false);
     double sum = 0.0;
-    for (size_t i = 0; i < uv.size(); ++i) {
+    for (size_t i = 0; i < ws.uv.size(); ++i) {
         const float vi = sample_bilinear_f32(
-            gs, static_cast<float>(uv[i].x - n_img[i].x), static_cast<float>(uv[i].y - n_img[i].y));
+            gs, static_cast<float>(ws.uv[i].x - ws.n_img[i].x), static_cast<float>(ws.uv[i].y - ws.n_img[i].y));
         const float vo = sample_bilinear_f32(
-            gs, static_cast<float>(uv[i].x + n_img[i].x), static_cast<float>(uv[i].y + n_img[i].y));
+            gs, static_cast<float>(ws.uv[i].x + ws.n_img[i].x), static_cast<float>(ws.uv[i].y + ws.n_img[i].y));
         sum += static_cast<double>(vi - vo);
     }
-    return sum / std::max<size_t>(uv.size(), 1);
+    return sum / std::max<size_t>(ws.uv.size(), 1);
 }
 
 struct SeedHyp {
     double score;
     cv::Matx33d R;
     int yaw_deg;
+};
+
+struct ChamferCand {
+    double dt_score;
+    cv::Matx33d R;
+    cv::Vec3d t;
 };
 
 struct RefinedCand {
@@ -555,7 +721,7 @@ std::vector<CharTemplate> load_templates_csv(const std::string& csv_path) {
 }
 
 cv::Vec3d SparseEdgePoseSolver::rvec_to_euler_yxz_deg(const cv::Vec3d& rvec) {
-    const cv::Matx33d R = rvec_to_mat(rvec);
+    const cv::Matx33d R = exp_so3(rvec[0], rvec[1], rvec[2]);
     const double yaw = rad2deg(std::asin(std::clamp(R(0, 2), -1.0, 1.0)));
     const double pitch = rad2deg(std::atan2(-R(1, 2), R(2, 2)));
     const double roll = rad2deg(std::atan2(-R(0, 1), R(0, 0)));
@@ -566,7 +732,7 @@ std::vector<cv::Point2d> SparseEdgePoseSolver::project_points(const CharTemplate
                                                               const cv::Vec3d& rvec,
                                                               const cv::Vec3d& tvec,
                                                               const CameraIntrinsics& K) {
-    const cv::Matx33d R = rvec_to_mat(rvec);
+    const cv::Matx33d R = exp_so3(rvec[0], rvec[1], rvec[2]);
     std::vector<cv::Point2d> out;
     out.reserve(tpl.points.size());
     for (const auto& mp : tpl.points) {
@@ -819,7 +985,9 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     cv::Mat gs;
     cv::GaussianBlur(sub, gs, cv::Size(0, 0), 1.0);
 
-    std::vector<RefinedCand> refined;
+    SolverWorkspace ws;
+    ws.reserve(tpl.points.size());
+    const double r_mm = 0.5 * std::hypot(tpl.width_mm, tpl.height_mm);
     const double chamfer_gate = std::max(8.0, 0.06 * h_c);
     const int edge_r0 = std::clamp(static_cast<int>(std::round(0.04 * h_c)), 6, 14);
     std::vector<int> radii;
@@ -828,20 +996,54 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     } else {
         radii = {6, 4, 3, 2};
     }
-    bool high_conf_lock = false;
-    for (size_t ci = 0; ci < cands.size(); ++ci) {
-        if (ci >= 4 && high_conf_lock) break;
-        const auto& cand = cands[ci];
+
+    // Stage A: Damped Chamfer alignment (max 5 iters, pixel-step early stop) + 4-deg deduplication
+    std::vector<ChamferCand> ch_results;
+    ch_results.reserve(cands.size());
+    for (const auto& cand : cands) {
         cv::Matx33d R = cand.R;
         cv::Vec3d t = t0;
-        refine_chamfer_gated(dt, dtx, dty, R, t, tpl, Kc, 8, chamfer_gate, 3.0);
+        const double ch_dt = refine_chamfer_gated(dt, dtx, dty, R, t, tpl, Kc, ws, r_mm, 5, chamfer_gate, 3.0);
+        ch_results.push_back({ch_dt, R, t});
+    }
+    std::sort(ch_results.begin(), ch_results.end(),
+              [](const ChamferCand& a, const ChamferCand& b) { return a.dt_score < b.dt_score; });
+
+    std::vector<ChamferCand> edge_cands;
+    edge_cands.reserve(4);
+    for (const auto& item : ch_results) {
+        bool dup = false;
+        for (const auto& kept : edge_cands) {
+            if (rot_err_deg(item.R, kept.R) <= 4.0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        edge_cands.push_back(item);
+        if (edge_cands.size() >= 4) break;
+    }
+
+    // Stage B: 1D Edge IRLS on top <=4 distinct Chamfer basins; early exit once both yaw signs covered + locked
+    std::vector<RefinedCand> refined;
+    refined.reserve(edge_cands.size());
+    bool high_conf_lock = false;
+    bool best_pos_yaw = false;
+    bool best_neg_yaw = false;
+    for (const auto& cand : edge_cands) {
+        if (high_conf_lock && best_pos_yaw && best_neg_yaw) break;
+        cv::Matx33d R = cand.R;
+        cv::Vec3d t = cand.t;
         double med = 0.0, frac = 0.0;
-        refine_edges_lie(gs, R, t, tpl, Kc, radii, med, frac, 1.5);
+        refine_edges_lie(gs, R, t, tpl, Kc, radii, ws, r_mm, med, frac, 1.5);
         if (!std::isfinite(med) || !is_finite_pose(R, t)) continue;
-        const double phot = boundary_phot_contrast(gs, tpl, R, t, Kc);
+        const double phot = boundary_phot_contrast(gs, tpl, R, t, Kc, ws);
         if (!std::isfinite(phot)) continue;
         const double sc = phot * (frac * frac) - 2.0 * std::max(med - 0.5, 0.0);
         refined.push_back({R, t, sc, phot, med, frac});
+        const double yaw = mat_yaw_deg(R);
+        if (yaw >= -3.0) best_pos_yaw = true;
+        if (yaw <= 3.0) best_neg_yaw = true;
         if (frac >= 0.80 && med <= 0.45 && phot > 8.0) {
             high_conf_lock = true;
         }
@@ -905,10 +1107,13 @@ PoseResult SparseEdgePoseSolver::solve_tracking(const cv::Mat& gray,
     Kc.cx -= x0;
     Kc.cy -= y0;
 
-    cv::Matx33d R = rvec_to_mat(prev_rvec);
+    cv::Matx33d R = exp_so3(prev_rvec[0], prev_rvec[1], prev_rvec[2]);
     cv::Vec3d t = prev_tvec;
+    SolverWorkspace ws;
+    ws.reserve(tpl.points.size());
+    const double r_mm = 0.5 * std::hypot(tpl.width_mm, tpl.height_mm);
     double med = 0.0, frac = 0.0;
-    refine_edges_lie(gs, R, t, tpl, Kc, {4, 2, 2}, med, frac, 1.5);
+    refine_edges_lie(gs, R, t, tpl, Kc, {4, 2, 2}, ws, r_mm, med, frac, 1.5);
     if (!std::isfinite(med) || !is_finite_pose(R, t)) return res;
 
     res.valid = true;
@@ -917,7 +1122,7 @@ PoseResult SparseEdgePoseSolver::solve_tracking(const cv::Mat& gray,
     res.euler_yxz_deg = rvec_to_euler_yxz_deg(res.rvec);
     res.edge_med_px = med;
     res.edge_frac = frac;
-    res.phot_contrast = boundary_phot_contrast(gs, tpl, R, t, Kc);
+    res.phot_contrast = boundary_phot_contrast(gs, tpl, R, t, Kc, ws);
     res.mirror_gap = std::numeric_limits<double>::infinity();
     const auto t_end = std::chrono::steady_clock::now();
     res.solve_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
