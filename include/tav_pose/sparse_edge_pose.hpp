@@ -45,12 +45,15 @@ public:
 
     /// Hybrid Option-A cold-start: 64x64 RoiCornerPrior + Dual-IPPE + adaptive 1~3-step Lie 1D Edge,
     /// with automatic safety fallback to Tier-1 `solve_cold_start` if residual or coverage fails gate.
+    /// When `sparse_1d_raw` is true (O1n_pe), skips full-ROI float/LED-mask/GaussianBlur and samples
+    /// raw uint8 along contour normals with 5-tap [1,4,6,4,1]/16 1D smoothing.
     static PoseResult solve_cold_start_hybrid(const cv::Mat& gray,
                                               const cv::Rect2f& box,
                                               const CharTemplate& tpl,
                                               const CameraIntrinsics& K,
                                               const RoiCornerPrior* corner_prior,
-                                              int margin = 14);
+                                              int margin = 14,
+                                              bool sparse_1d_raw = false);
 
     /// Temporal tracking mode: refines directly from previous frame's (rvec, tvec).
     static PoseResult solve_tracking(const cv::Mat& gray,

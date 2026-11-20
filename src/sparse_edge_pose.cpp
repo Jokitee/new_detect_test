@@ -151,6 +151,42 @@ inline float sample_bilinear_f32(const cv::Mat& img, float x, float y) {
     return v0 * (1.0f - fy) + v1 * fy;
 }
 
+inline float sample_bilinear_u8_masked(const cv::Mat& raw_u8,
+                                       float x,
+                                       float y,
+                                       bool mask_led,
+                                       int ix0,
+                                       int iy0,
+                                       int ix1,
+                                       int iy1,
+                                       float led_thr,
+                                       float bg_med) {
+    if (!std::isfinite(x) || !std::isfinite(y) || raw_u8.empty()) return 0.0f;
+    const int w = raw_u8.cols;
+    const int h = raw_u8.rows;
+    const float xc = std::clamp(x, 0.0f, static_cast<float>(w - 1));
+    const float yc = std::clamp(y, 0.0f, static_cast<float>(h - 1));
+    const int x0 = static_cast<int>(std::floor(xc));
+    const int y0 = static_cast<int>(std::floor(yc));
+    const int x1 = std::min(x0 + 1, w - 1);
+    const int y1 = std::min(y0 + 1, h - 1);
+    const float fx = xc - x0;
+    const float fy = yc - y0;
+
+    const uchar* r0 = raw_u8.ptr<uchar>(y0);
+    const uchar* r1 = raw_u8.ptr<uchar>(y1);
+    const float v0 = static_cast<float>(r0[x0]) * (1.0f - fx) + static_cast<float>(r0[x1]) * fx;
+    const float v1 = static_cast<float>(r1[x0]) * (1.0f - fx) + static_cast<float>(r1[x1]) * fx;
+    float v = v0 * (1.0f - fy) + v1 * fy;
+    if (mask_led &&
+        (x < static_cast<float>(ix0) || x >= static_cast<float>(ix1) ||
+         y < static_cast<float>(iy0) || y >= static_cast<float>(iy1)) &&
+        v > led_thr) {
+        v = bg_med;
+    }
+    return v;
+}
+
 void compute_hist_percentiles_u8(const cv::Mat& core, double& p50, double& p95) {
     std::array<int, 256> hist{};
     const int total = core.rows * core.cols;
@@ -264,12 +300,31 @@ bool solve_6x6(const cv::Matx66d& H, const cv::Vec6d& g, cv::Vec6d& dx) {
 
 struct EdgeSearchScratch {
     std::vector<float> v;
+    std::vector<float> ext_v;
     std::vector<float> dmins;
     std::vector<float> neg_dmins;
     std::vector<float> all_d;
     std::vector<double> off;
     std::vector<uint8_t> valid;
     int n_valid = 0;
+};
+
+struct EdgeImgSource {
+    const cv::Mat* gs_f32 = nullptr;
+    const cv::Mat* raw_u8 = nullptr;
+    bool mask_led = false;
+    int ix0 = 0;
+    int iy0 = 0;
+    int ix1 = 0;
+    int iy1 = 0;
+    float led_thr = 0.0f;
+    float bg_med = 0.0f;
+
+    static EdgeImgSource from_blur(const cv::Mat& gs) {
+        EdgeImgSource s;
+        s.gs_f32 = &gs;
+        return s;
+    }
 };
 
 struct SolverWorkspace {
@@ -338,11 +393,12 @@ inline void mirror_upper_sym_6x6(cv::Matx66d& H) {
     }
 }
 
-void edge_search(const cv::Mat& gs,
-                 const std::vector<cv::Point2d>& pts_img,
-                 const std::vector<cv::Point2d>& n_img,
-                 int rad,
-                 EdgeSearchScratch& sc) {
+void edge_search_src(const EdgeImgSource& src,
+                     const std::vector<cv::Point2d>& pts_img,
+                     const std::vector<cv::Point2d>& n_img,
+                     int rad,
+                     EdgeSearchScratch& sc,
+                     double* out_phot = nullptr) {
     const int n_pts = static_cast<int>(pts_img.size());
     const int len = 2 * rad + 1;
     const int dlen = len - 2;
@@ -354,15 +410,38 @@ void edge_search(const cv::Mat& gs,
     sc.dmins.resize(n_pts);
     sc.neg_dmins.resize(n_pts);
     sc.all_d.resize(static_cast<size_t>(n_pts) * static_cast<size_t>(dlen));
+    if (src.raw_u8) sc.ext_v.resize(len + 4);
 
+    double phot_sum = 0.0;
     for (int i = 0; i < n_pts; ++i) {
         const float px = static_cast<float>(pts_img[i].x);
         const float py = static_cast<float>(pts_img[i].y);
         const float nx = static_cast<float>(n_img[i].x);
         const float ny = static_cast<float>(n_img[i].y);
-        for (int k = 0; k < len; ++k) {
-            const float o = static_cast<float>(k - rad);
-            sc.v[k] = sample_bilinear_f32(gs, px + o * nx, py + o * ny);
+        if (src.raw_u8) {
+            const int ext_len = len + 4;
+            for (int k = 0; k < ext_len; ++k) {
+                const float o = static_cast<float>(k - rad - 2);
+                sc.ext_v[k] = sample_bilinear_u8_masked(
+                    *src.raw_u8, px + o * nx, py + o * ny,
+                    src.mask_led, src.ix0, src.iy0, src.ix1, src.iy1, src.led_thr, src.bg_med);
+            }
+            constexpr float kW0 = 1.0f / 16.0f;
+            constexpr float kW1 = 4.0f / 16.0f;
+            constexpr float kW2 = 6.0f / 16.0f;
+            for (int k = 0; k < len; ++k) {
+                sc.v[k] = kW0 * (sc.ext_v[k] + sc.ext_v[k + 4]) +
+                          kW1 * (sc.ext_v[k + 1] + sc.ext_v[k + 3]) +
+                          kW2 * sc.ext_v[k + 2];
+            }
+        } else {
+            for (int k = 0; k < len; ++k) {
+                const float o = static_cast<float>(k - rad);
+                sc.v[k] = sample_bilinear_f32(*src.gs_f32, px + o * nx, py + o * ny);
+            }
+        }
+        if (out_phot && rad >= 1) {
+            phot_sum += static_cast<double>(sc.v[rad - 1] - sc.v[rad + 1]);
         }
         float* di = sc.all_d.data() + static_cast<size_t>(i) * static_cast<size_t>(dlen);
         float dmin = std::numeric_limits<float>::infinity();
@@ -373,6 +452,9 @@ void edge_search(const cv::Mat& gs,
         }
         sc.dmins[i] = dmin;
         sc.neg_dmins[i] = -dmin;
+    }
+    if (out_phot) {
+        *out_phot = phot_sum / std::max(n_pts, 1);
     }
 
     std::nth_element(sc.neg_dmins.begin(), sc.neg_dmins.begin() + n_pts / 2, sc.neg_dmins.end());
@@ -590,7 +672,7 @@ double refine_chamfer_gated(const cv::Mat& dt,
     return sum_trunc / std::max<size_t>(N, 1);
 }
 
-bool run_single_edge_step(const cv::Mat& gs,
+bool run_single_edge_step(const EdgeImgSource& src,
                           const CharTemplate& tpl,
                           const CameraIntrinsics& K,
                           int rad,
@@ -606,7 +688,7 @@ bool run_single_edge_step(const cv::Mat& gs,
                           cv::Vec6d& out_dx) {
     const int min_valid = std::min(12, std::max(6, static_cast<int>(tpl.points.size()) / 2));
     project_points_and_normals(tpl, R, t, K, ws, true);
-    edge_search(gs, ws.uv, ws.n_img, rad, ws.es);
+    edge_search_src(src, ws.uv, ws.n_img, rad, ws.es);
     if (ws.es.n_valid < min_valid) return false;
 
     cv::Matx66d H = cv::Matx66d::zeros();
@@ -655,10 +737,11 @@ void refine_edges_lie(const cv::Mat& gs,
                       double huber = 1.5) {
     out_med = std::numeric_limits<double>::quiet_NaN();
     out_frac = 0.0;
+    const EdgeImgSource src = EdgeImgSource::from_blur(gs);
     for (int rad : radii) {
         double p90 = 0.0;
         cv::Vec6d dx;
-        if (!run_single_edge_step(gs, tpl, K, rad, huber, 1e-6, 1e-12, R, t, ws,
+        if (!run_single_edge_step(src, tpl, K, rad, huber, 1e-6, 1e-12, R, t, ws,
                                   out_med, p90, out_frac, dx)) {
             break;
         }
@@ -666,19 +749,21 @@ void refine_edges_lie(const cv::Mat& gs,
     }
 }
 
-void eval_edge_residual_fixed(const cv::Mat& gs,
-                              const cv::Matx33d& R,
-                              const cv::Vec3d& t,
-                              const CharTemplate& tpl,
-                              const CameraIntrinsics& K,
-                              int rad,
-                              SolverWorkspace& ws,
-                              double& out_med,
-                              double& out_frac) {
+void eval_edge_residual_and_phot(const EdgeImgSource& src,
+                                 const cv::Matx33d& R,
+                                 const cv::Vec3d& t,
+                                 const CharTemplate& tpl,
+                                 const CameraIntrinsics& K,
+                                 int rad,
+                                 SolverWorkspace& ws,
+                                 double& out_med,
+                                 double& out_frac,
+                                 double& out_phot) {
     out_med = std::numeric_limits<double>::quiet_NaN();
     out_frac = 0.0;
+    out_phot = std::numeric_limits<double>::quiet_NaN();
     project_points_and_normals(tpl, R, t, K, ws, false);
-    edge_search(gs, ws.uv, ws.n_img, rad, ws.es);
+    edge_search_src(src, ws.uv, ws.n_img, rad, ws.es, &out_phot);
     if (ws.es.n_valid <= 0) return;
     ws.abs_e.clear();
     for (size_t i = 0; i < tpl.points.size(); ++i) {
@@ -690,7 +775,7 @@ void eval_edge_residual_fixed(const cv::Mat& gs,
     out_frac = static_cast<double>(ws.es.n_valid) / static_cast<double>(tpl.points.size());
 }
 
-void refine_edges_lie_adaptive(const cv::Mat& gs,
+void refine_edges_lie_adaptive(const EdgeImgSource& src,
                                cv::Matx33d& R,
                                cv::Vec3d& t,
                                const CharTemplate& tpl,
@@ -700,12 +785,13 @@ void refine_edges_lie_adaptive(const cv::Mat& gs,
                                SolverWorkspace& ws,
                                double r_mm,
                                double& out_med,
-                               double& out_frac) {
+                               double& out_frac,
+                               double& out_phot) {
     int cur_rad = std::max(3, r0);
     for (int it = 0; it < edge_steps; ++it) {
         double step_med = 0.0, step_p90 = 0.0, step_frac = 0.0;
         cv::Vec6d dx;
-        if (!run_single_edge_step(gs, tpl, K, cur_rad, 1.5, 1e-5, 1e-11, R, t, ws,
+        if (!run_single_edge_step(src, tpl, K, cur_rad, 1.5, 1e-5, 1e-11, R, t, ws,
                                   step_med, step_p90, step_frac, dx)) {
             break;
         }
@@ -715,7 +801,7 @@ void refine_edges_lie_adaptive(const cv::Mat& gs,
                                  3, std::min(5, r0));
         }
     }
-    eval_edge_residual_fixed(gs, R, t, tpl, K, 4, ws, out_med, out_frac);
+    eval_edge_residual_and_phot(src, R, t, tpl, K, 4, ws, out_med, out_frac, out_phot);
 }
 
 cv::Mat build_led_masked_sub_f32(const cv::Mat& gray,
@@ -1180,6 +1266,18 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     return res;
 }
 
+cv::Mat ensure_gray_u8(const cv::Mat& src) {
+    if (src.channels() == 1 && src.depth() == CV_8U) return src;
+    cv::Mat gray1;
+    if (src.channels() == 3) {
+        cv::cvtColor(src, gray1, cv::COLOR_BGR2GRAY);
+        if (gray1.depth() != CV_8U) gray1.convertTo(gray1, CV_8U);
+    } else {
+        src.convertTo(gray1, CV_8U);
+    }
+    return gray1;
+}
+
 RoiCornerPrior::RoiCornerPrior(const std::string& onnx_path) {
     net_ = cv::dnn::readNetFromONNX(onnx_path);
     if (net_.empty()) {
@@ -1197,15 +1295,7 @@ bool RoiCornerPrior::predict(const cv::Mat& gray_u8,
                              std::array<cv::Point2d, 4>& out_corners) const {
     if (net_.empty() || out_names_.empty() || gray_u8.empty()) return false;
 
-    cv::Mat gray1;
-    if (gray_u8.channels() == 1 && gray_u8.depth() == CV_8U) {
-        gray1 = gray_u8;
-    } else if (gray_u8.channels() == 3) {
-        cv::cvtColor(gray_u8, gray1, cv::COLOR_BGR2GRAY);
-        if (gray1.depth() != CV_8U) gray1.convertTo(gray1, CV_8U);
-    } else {
-        gray_u8.convertTo(gray1, CV_8U);
-    }
+    const cv::Mat gray1 = ensure_gray_u8(gray_u8);
 
     constexpr int kRoiSz = 64;
     constexpr double kPadScale = 1.48;
@@ -1278,29 +1368,37 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
                                                          const CharTemplate& tpl,
                                                          const CameraIntrinsics& K,
                                                          const RoiCornerPrior* corner_prior,
-                                                         int margin) {
+                                                         int margin,
+                                                         bool sparse_1d_raw) {
     if (!corner_prior || corner_prior->empty()) {
         return solve_cold_start(gray, box, tpl, K, margin);
     }
-    const auto t_start = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    auto ms_between = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto t_start = Clock::now();
     PoseResult res;
     if (gray.empty() || tpl.points.empty() || K.fx <= 1.0 || K.fy <= 1.0) return res;
 
+    const cv::Mat gray1 = ensure_gray_u8(gray);
     auto fallback = [&]() {
-        PoseResult fb = solve_cold_start(gray, box, tpl, K, margin);
+        PoseResult fb = solve_cold_start(gray1, box, tpl, K, margin);
         if (fb.valid) {
             fb.used_fallback = true;
-            fb.solve_ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - t_start)
-                              .count();
+            fb.timing = res.timing;
+            fb.solve_ms = ms_between(t_start, Clock::now());
         }
         return fb;
     };
 
     std::array<cv::Point2d, 4> p4{};
-    if (!corner_prior->predict(gray, box, tpl.cls_id, p4)) {
+    if (!corner_prior->predict(gray1, box, tpl.cls_id, p4)) {
+        res.timing.corner_ms = ms_between(t_start, Clock::now());
         return fallback();
     }
+    const auto t_corner = Clock::now();
+    res.timing.corner_ms = ms_between(t_start, t_corner);
 
     const double hw = 0.5 * tpl.width_mm;
     const double hh = 0.5 * tpl.height_mm;
@@ -1318,57 +1416,81 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
     std::vector<cv::Mat> rvecs, tvecs;
     const int n_sol = cv::solvePnPGeneric(
         rect3, img4, K_mat, cv::noArray(), rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
+    const auto t_ippe = Clock::now();
+    res.timing.ippe_ms = ms_between(t_corner, t_ippe);
     if (n_sol <= 0 || rvecs.empty() || tvecs.empty()) {
         return fallback();
     }
 
-    const int W_im = gray.cols;
-    const int H_im = gray.rows;
+    const int W_im = gray1.cols;
+    const int H_im = gray1.rows;
     const double bx0 = box.x;
     const double by0 = box.y;
     const double bx1 = box.x + box.width;
     const double by1 = box.y + box.height;
     const double bh = std::max(by1 - by0, 4.0);
 
-    double min_px = bx0, max_px = bx1, min_py = by0, max_py = by1;
-    for (const auto& pt : p4) {
-        min_px = std::min(min_px, pt.x);
-        max_px = std::max(max_px, pt.x);
-        min_py = std::min(min_py, pt.y);
-        max_py = std::max(max_py, pt.y);
-    }
-    const int roi_pad = std::max(margin, 18);
-    const int x0 = std::max(0, static_cast<int>(std::floor(min_px)) - roi_pad);
-    const int y0 = std::max(0, static_cast<int>(std::floor(min_py)) - roi_pad);
-    const int x1 = std::min(W_im, static_cast<int>(std::ceil(max_px)) + roi_pad + 1);
-    const int y1 = std::min(H_im, static_cast<int>(std::ceil(max_py)) + roi_pad + 1);
-    if (x1 <= x0 + 2 || y1 <= y0 + 2) return fallback();
-
-    const int ix0 = std::clamp(static_cast<int>(std::floor(bx0)), x0, x1 - 1);
-    const int iy0 = std::clamp(static_cast<int>(std::floor(by0)), y0, y1 - 1);
-    const int ix1 = std::clamp(static_cast<int>(std::ceil(bx1)), ix0 + 1, x1);
-    const int iy1 = std::clamp(static_cast<int>(std::ceil(by1)), iy0 + 1, y1);
-    const cv::Mat core = gray(cv::Rect(ix0, iy0, ix1 - ix0, iy1 - iy0));
-
-    cv::Mat sub;
-    if (core.total() >= 16) {
-        double bg_med = 0.0, p95_in = 0.0;
-        compute_hist_percentiles_u8(core, bg_med, p95_in);
-        const double led_thr = std::max(p95_in * 1.5, 80.0);
-        sub = build_led_masked_sub_f32(gray, ix0, iy0, ix1, iy1, x0, y0, x1, y1, led_thr, bg_med);
-    } else {
-        gray(cv::Rect(x0, y0, x1 - x0, y1 - y0)).convertTo(sub, CV_32F);
-    }
     cv::Mat gs;
-    cv::GaussianBlur(sub, gs, cv::Size(0, 0), 1.0);
-
+    EdgeImgSource edge_src;
     CameraIntrinsics Kc = K;
-    Kc.cx -= x0;
-    Kc.cy -= y0;
-    std::array<cv::Point2d, 4> pts_roi{};
-    for (int k = 0; k < 4; ++k) {
-        pts_roi[k] = cv::Point2d(p4[k].x - x0, p4[k].y - y0);
+    std::array<cv::Point2d, 4> pts_ref = p4;
+
+    if (sparse_1d_raw) {
+        edge_src.raw_u8 = &gray1;
+        edge_src.ix0 = std::clamp(static_cast<int>(std::floor(bx0)), 0, W_im - 1);
+        edge_src.iy0 = std::clamp(static_cast<int>(std::floor(by0)), 0, H_im - 1);
+        edge_src.ix1 = std::clamp(static_cast<int>(std::ceil(bx1)), edge_src.ix0 + 1, W_im);
+        edge_src.iy1 = std::clamp(static_cast<int>(std::ceil(by1)), edge_src.iy0 + 1, H_im);
+        const cv::Mat core = gray1(cv::Rect(edge_src.ix0, edge_src.iy0,
+                                            edge_src.ix1 - edge_src.ix0,
+                                            edge_src.iy1 - edge_src.iy0));
+        if (core.total() >= 16) {
+            double bg_med = 0.0, p95_in = 0.0;
+            compute_hist_percentiles_u8(core, bg_med, p95_in);
+            edge_src.mask_led = true;
+            edge_src.bg_med = static_cast<float>(bg_med);
+            edge_src.led_thr = static_cast<float>(std::max(p95_in * 1.5, 80.0));
+        }
+    } else {
+        double min_px = bx0, max_px = bx1, min_py = by0, max_py = by1;
+        for (const auto& pt : p4) {
+            min_px = std::min(min_px, pt.x);
+            max_px = std::max(max_px, pt.x);
+            min_py = std::min(min_py, pt.y);
+            max_py = std::max(max_py, pt.y);
+        }
+        const int roi_pad = std::max(margin, 18);
+        const int x0 = std::max(0, static_cast<int>(std::floor(min_px)) - roi_pad);
+        const int y0 = std::max(0, static_cast<int>(std::floor(min_py)) - roi_pad);
+        const int x1 = std::min(W_im, static_cast<int>(std::ceil(max_px)) + roi_pad + 1);
+        const int y1 = std::min(H_im, static_cast<int>(std::ceil(max_py)) + roi_pad + 1);
+        if (x1 <= x0 + 2 || y1 <= y0 + 2) return fallback();
+
+        const int ix0 = std::clamp(static_cast<int>(std::floor(bx0)), x0, x1 - 1);
+        const int iy0 = std::clamp(static_cast<int>(std::floor(by0)), y0, y1 - 1);
+        const int ix1 = std::clamp(static_cast<int>(std::ceil(bx1)), ix0 + 1, x1);
+        const int iy1 = std::clamp(static_cast<int>(std::ceil(by1)), iy0 + 1, y1);
+        const cv::Mat core = gray1(cv::Rect(ix0, iy0, ix1 - ix0, iy1 - iy0));
+
+        cv::Mat sub;
+        if (core.total() >= 16) {
+            double bg_med = 0.0, p95_in = 0.0;
+            compute_hist_percentiles_u8(core, bg_med, p95_in);
+            const double led_thr = std::max(p95_in * 1.5, 80.0);
+            sub = build_led_masked_sub_f32(gray1, ix0, iy0, ix1, iy1, x0, y0, x1, y1, led_thr, bg_med);
+        } else {
+            gray1(cv::Rect(x0, y0, x1 - x0, y1 - y0)).convertTo(sub, CV_32F);
+        }
+        cv::GaussianBlur(sub, gs, cv::Size(0, 0), 1.0);
+        edge_src = EdgeImgSource::from_blur(gs);
+        Kc.cx -= x0;
+        Kc.cy -= y0;
+        for (int k = 0; k < 4; ++k) {
+            pts_ref[k] = cv::Point2d(p4[k].x - x0, p4[k].y - y0);
+        }
     }
+    const auto t_prep = Clock::now();
+    res.timing.roi_prep_ms = ms_between(t_ippe, t_prep);
 
     const int r0 = std::clamp(static_cast<int>(std::round(0.035 * bh)), 4, 8);
     const int edge_steps = (bh < 58.0) ? 1 : 3;
@@ -1392,12 +1514,9 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
         cv::Vec3d t(tp[0], tp[1], tp[2]);
         if (!is_finite_pose(R, t)) continue;
 
-        double med = 0.0, frac = 0.0;
-        refine_edges_lie_adaptive(gs, R, t, tpl, Kc, edge_steps, r0, ws, r_mm, med, frac);
-        if (!std::isfinite(med) || !is_finite_pose(R, t)) continue;
-
-        const double phot = boundary_phot_contrast(gs, tpl, R, t, Kc, ws);
-        if (!std::isfinite(phot)) continue;
+        double med = 0.0, frac = 0.0, phot = 0.0;
+        refine_edges_lie_adaptive(edge_src, R, t, tpl, Kc, edge_steps, r0, ws, r_mm, med, frac, phot);
+        if (!std::isfinite(med) || !std::isfinite(phot) || !is_finite_pose(R, t)) continue;
 
         double c_rep = 0.0;
         for (int k = 0; k < 4; ++k) {
@@ -1406,7 +1525,7 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
             const double Z = std::max(R(2, 0) * rect3[k].x + R(2, 1) * rect3[k].y + t[2], 1e-6);
             const double px = Kc.fx * (X / Z) + Kc.cx;
             const double py = Kc.fy * (Y / Z) + Kc.cy;
-            c_rep += std::hypot(px - pts_roi[k].x, py - pts_roi[k].y);
+            c_rep += std::hypot(px - pts_ref[k].x, py - pts_ref[k].y);
         }
         c_rep *= 0.25;
 
@@ -1415,6 +1534,9 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
                         - 60.0 * (c_rep / std::max(bh, 20.0));
         refined.push_back({R, t, sc, phot, med, frac});
     }
+    const auto t_edge = Clock::now();
+    res.timing.edge_ms = ms_between(t_prep, t_edge);
+
     if (refined.empty()) return fallback();
 
     std::sort(refined.begin(), refined.end(),
@@ -1439,8 +1561,7 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
             break;
         }
     }
-    const auto t_end = std::chrono::steady_clock::now();
-    res.solve_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    res.solve_ms = ms_between(t_start, Clock::now());
     return res;
 }
 

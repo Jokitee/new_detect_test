@@ -62,6 +62,7 @@ private:
     double m1_min_edge_frac_ = 0.22;
     double m1_max_edge_med_px_ = 2.50;
     bool use_tracking_ = false;
+    bool fast_1d_ = false;
     int redetect_every_ = 15;
     bool one_as_big_ = true;
     std::string color_mode_ = "auto";

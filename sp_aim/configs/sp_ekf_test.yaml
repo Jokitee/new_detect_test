@@ -22,6 +22,7 @@ m1_gate_enable: true
 m1_min_edge_frac: 0.22
 m1_max_edge_med_px: 2.50
 m1_track: false
+m1_fast_1d: false                   # true=跳过整块ROI浮点/高斯模糊，改用1D法向采样+5点平滑(O1n_pe)
 m1_redetect_every: 15
 use_optimize_yaw: false             # false=直接使用Pure-M1连续6DoF Yaw; true=开启1deg离散重投影对比
 

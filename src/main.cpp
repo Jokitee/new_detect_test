@@ -82,6 +82,7 @@ struct Args {
     std::string templates_path = "assets/templates.csv";
     bool use_corner_prior = true;
     bool corner_model_explicit = false;
+    bool fast_1d = false;
     std::string out_path;
     std::string roi_str;
     std::string cls_name = "1";
@@ -126,6 +127,7 @@ void print_usage() {
         << "  --model <onnx>       ONNX path (default assets/ifl_net_v2_448x336.onnx)\n"
         << "  --corner-model <onnx> 64x64 ROI corner prior ONNX (default assets/roi_corner_v2_64x64.onnx)\n"
         << "  --no-corner-prior    Disable 64x64 corner prior and run Pure-M1 Tier-1 cold-start only\n"
+        << "  --fast-1d            Skip full-ROI blur/float prep (O1n_pe: 1D normal sampling + 5-tap smooth)\n"
         << "  --templates <csv>    3D sparse contour CSV (default assets/templates.csv)\n"
         << "  --imgsz <int>        Square detector input size override (e.g. 416 for YOLOv8n)\n"
         << "  --det-w <int>        Detector input width (default 448, or 416 if YOLOv8 416)\n"
@@ -183,6 +185,7 @@ Args parse_args(int argc, char** argv) {
             a.corner_model_path = next();
             a.corner_model_explicit = true;
         } else if (k == "--no-corner-prior") a.use_corner_prior = false;
+        else if (k == "--fast-1d") a.fast_1d = true;
         else if (k == "--templates") a.templates_path = next();
         else if (k == "--out") a.out_path = next();
         else if (k == "--roi") a.roi_str = next();
@@ -397,7 +400,7 @@ FrameMetrics process_frame(const cv::Mat& frame,
                 item.det = solve_dets[i];
                 item.tpl = tpls[i];
                 item.pose = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
-                    gray, solve_dets[i].box, *tpls[i], K, corner_prior);
+                    gray, solve_dets[i].box, *tpls[i], K, corner_prior, 14, args.fast_1d);
                 metrics.targets[i] = std::move(item);
             };
             if (n_solve > 1) {
@@ -652,25 +655,54 @@ int run_image_mode(const Args& args,
         }
         const char* mode_tag =
             (!corner_prior || corner_prior->empty()) ? "Pure-M1" :
-            (item.pose.used_fallback ? "Hybrid->M1-FB" : "Hybrid-V2");
+            (item.pose.used_fallback ? "Hybrid->M1-FB" : (args.fast_1d ? "Hybrid-O1n" : "Hybrid-Bpe"));
         std::printf("  [%zu] cls=%s conf=%.2f box=[%.0f, %.0f, %.0f, %.0f]\n",
                     i, item.det.cls_name.c_str(), item.det.conf,
                     item.det.box.x, item.det.box.y,
                     item.det.box.x + item.det.box.width,
                     item.det.box.y + item.det.box.height);
         std::printf("      Pose (%s): ypr=(%+.1f, %+.1f, %+.1f) deg  t=(%+.1f, %+.1f, %.1f)mm  "
-                    "edge=%.2fpx (%.0f%%)  mirror_gap=%.3f  time=%.2f ms\n",
+                    "edge=%.2fpx (%.0f%%)  mirror_gap=%.3f  time=%.2f ms "
+                    "[cnn=%.2f ippe=%.2f prep=%.2f edge=%.2f]\n",
                     mode_tag, item.pose.euler_yxz_deg[0], item.pose.euler_yxz_deg[1],
                     item.pose.euler_yxz_deg[2], item.pose.tvec[0], item.pose.tvec[1],
                     item.pose.tvec[2], item.pose.edge_med_px, 100.0 * item.pose.edge_frac,
-                    item.pose.mirror_gap, item.pose.solve_ms);
+                    item.pose.mirror_gap, item.pose.solve_ms,
+                    item.pose.timing.corner_ms, item.pose.timing.ippe_ms,
+                    item.pose.timing.roi_prep_ms, item.pose.timing.edge_ms);
 
         if (args.bench_runs > 0 && item.tpl) {
-            double sum_hybrid = 0.0, sum_cold = 0.0, sum_trk = 0.0;
+            if (corner_prior && !corner_prior->empty()) {
+                tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                    gray, item.det.box, *item.tpl, K, corner_prior, 14, false);
+                tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                    gray, item.det.box, *item.tpl, K, corner_prior, 14, true);
+            }
+            tav_pose::SparseEdgePoseSolver::solve_cold_start(gray, item.det.box, *item.tpl, K);
+            tav_pose::SparseEdgePoseSolver::solve_tracking(
+                gray, item.pose.rvec, item.pose.tvec, *item.tpl, K);
+
+            auto accum = [](tav_pose::PoseTiming& dst, const tav_pose::PoseTiming& src) {
+                dst.corner_ms += src.corner_ms;
+                dst.ippe_ms += src.ippe_ms;
+                dst.roi_prep_ms += src.roi_prep_ms;
+                dst.edge_ms += src.edge_ms;
+            };
+            double sum_bpe = 0.0, sum_o1n = 0.0, sum_cold = 0.0, sum_trk = 0.0;
+            tav_pose::PoseTiming tb{}, to{};
+            const double inv_n = 1.0 / static_cast<double>(args.bench_runs);
             for (int r = 0; r < args.bench_runs; ++r) {
-                sum_hybrid += tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
-                                  gray, item.det.box, *item.tpl, K, corner_prior)
-                                  .solve_ms;
+                if (corner_prior && !corner_prior->empty()) {
+                    const auto rb = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                        gray, item.det.box, *item.tpl, K, corner_prior, 14, false);
+                    sum_bpe += rb.solve_ms;
+                    accum(tb, rb.timing);
+
+                    const auto ro = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                        gray, item.det.box, *item.tpl, K, corner_prior, 14, true);
+                    sum_o1n += ro.solve_ms;
+                    accum(to, ro.timing);
+                }
                 sum_cold += tav_pose::SparseEdgePoseSolver::solve_cold_start(
                                 gray, item.det.box, *item.tpl, K)
                                 .solve_ms;
@@ -678,9 +710,22 @@ int run_image_mode(const Args& args,
                                gray, item.pose.rvec, item.pose.tvec, *item.tpl, K)
                                .solve_ms;
             }
-            std::printf("      Benchmark (%d runs): hybrid_avg=%.3f ms  pure_m1_avg=%.3f ms  track_avg=%.3f ms\n",
-                        args.bench_runs, sum_hybrid / args.bench_runs,
-                        sum_cold / args.bench_runs, sum_trk / args.bench_runs);
+            if (corner_prior && !corner_prior->empty()) {
+                std::printf("      Benchmark (%d runs):\n"
+                            "        hybrid_bpe_avg = %.3f ms  [cnn=%.3f ippe=%.3f prep=%.3f edge=%.3f]\n"
+                            "        hybrid_o1n_avg = %.3f ms  [cnn=%.3f ippe=%.3f prep=%.3f edge=%.3f]\n"
+                            "        pure_m1_avg    = %.3f ms\n"
+                            "        track_avg      = %.3f ms\n",
+                            args.bench_runs,
+                            sum_bpe * inv_n, tb.corner_ms * inv_n, tb.ippe_ms * inv_n,
+                            tb.roi_prep_ms * inv_n, tb.edge_ms * inv_n,
+                            sum_o1n * inv_n, to.corner_ms * inv_n, to.ippe_ms * inv_n,
+                            to.roi_prep_ms * inv_n, to.edge_ms * inv_n,
+                            sum_cold * inv_n, sum_trk * inv_n);
+            } else {
+                std::printf("      Benchmark (%d runs): pure_m1_avg=%.3f ms  track_avg=%.3f ms\n",
+                            args.bench_runs, sum_cold * inv_n, sum_trk * inv_n);
+            }
         }
     }
 

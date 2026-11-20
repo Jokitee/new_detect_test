@@ -107,6 +107,7 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     m1_min_edge_frac_ = read_yaml_or<double>(yaml, "m1_min_edge_frac", 0.22);
     m1_max_edge_med_px_ = read_yaml_or<double>(yaml, "m1_max_edge_med_px", 2.50);
     use_tracking_ = read_yaml_or<bool>(yaml, "m1_track", false);
+    fast_1d_ = read_yaml_or<bool>(yaml, "m1_fast_1d", false);
     redetect_every_ = std::max(1, read_yaml_or<int>(yaml, "m1_redetect_every", 15));
     one_as_big_ = read_yaml_or<bool>(yaml, "ifl_one_as_big", true);
     color_mode_ = read_yaml_or<std::string>(yaml, "ifl_color_mode", "auto");
@@ -381,7 +382,7 @@ std::list<SolvedArmor> PureM1ArmorDetector::detect(const cv::Mat& raw_bgr,
         const auto& d = dets[0];
         if (d.cls_id >= 0 && d.cls_id < static_cast<int>(templates_.size())) {
             poses[0] = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
-                gray, d.box, templates_[d.cls_id], K_last_, corner_prior_.get(), 14);
+                gray, d.box, templates_[d.cls_id], K_last_, corner_prior_.get(), 14, fast_1d_);
         }
     } else if (dets.size() > 1) {
         cv::parallel_for_(cv::Range(0, static_cast<int>(dets.size())), [&](const cv::Range& range) {
@@ -389,7 +390,7 @@ std::list<SolvedArmor> PureM1ArmorDetector::detect(const cv::Mat& raw_bgr,
                 const auto& d = dets[i];
                 if (d.cls_id >= 0 && d.cls_id < static_cast<int>(templates_.size())) {
                     poses[i] = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
-                        gray, d.box, templates_[d.cls_id], K_last_, corner_prior_.get(), 14);
+                        gray, d.box, templates_[d.cls_id], K_last_, corner_prior_.get(), 14, fast_1d_);
                 }
             }
         });

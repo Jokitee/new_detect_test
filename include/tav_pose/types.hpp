@@ -42,6 +42,13 @@ struct Detection {
     float conf = 0.0f;
 };
 
+struct PoseTiming {
+    double corner_ms = 0.0;
+    double ippe_ms = 0.0;
+    double roi_prep_ms = 0.0;
+    double edge_ms = 0.0;
+};
+
 struct PoseResult {
     bool valid = false;
     cv::Vec3d rvec{0.0, 0.0, 0.0};
@@ -53,6 +60,7 @@ struct PoseResult {
     double mirror_gap = 0.0;
     double solve_ms = 0.0;
     bool used_fallback = false;
+    PoseTiming timing;
 };
 
 std::vector<CharTemplate> load_templates_csv(const std::string& csv_path);
