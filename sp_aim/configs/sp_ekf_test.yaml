@@ -7,6 +7,7 @@ ifl_fallback_to_enemy_color: true   # 无灯条黑白靶标回退为 enemy_color
 
 # 2. IFL-Net V2-Slim + Pure-M1（复用 new_detect_test/assets 下模型与 64 点模板）
 ifl_model_path: "assets/ifl_net_v2_448x336.onnx"
+ifl_corner_model_path: "assets/roi_corner_v2_64x64.onnx"
 ifl_templates_path: "assets/templates.csv"
 ifl_det_w: 448
 ifl_det_h: 336

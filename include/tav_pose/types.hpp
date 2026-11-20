@@ -52,6 +52,7 @@ struct PoseResult {
     double phot_contrast = 0.0;
     double mirror_gap = 0.0;
     double solve_ms = 0.0;
+    bool used_fallback = false;
 };
 
 std::vector<CharTemplate> load_templates_csv(const std::string& csv_path);

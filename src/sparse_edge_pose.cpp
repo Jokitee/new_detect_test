@@ -590,6 +590,58 @@ double refine_chamfer_gated(const cv::Mat& dt,
     return sum_trunc / std::max<size_t>(N, 1);
 }
 
+bool run_single_edge_step(const cv::Mat& gs,
+                          const CharTemplate& tpl,
+                          const CameraIntrinsics& K,
+                          int rad,
+                          double huber,
+                          double damp_scale,
+                          double damp_eps,
+                          cv::Matx33d& R,
+                          cv::Vec3d& t,
+                          SolverWorkspace& ws,
+                          double& out_med,
+                          double& out_p90,
+                          double& out_frac,
+                          cv::Vec6d& out_dx) {
+    const int min_valid = std::min(12, std::max(6, static_cast<int>(tpl.points.size()) / 2));
+    project_points_and_normals(tpl, R, t, K, ws, true);
+    edge_search(gs, ws.uv, ws.n_img, rad, ws.es);
+    if (ws.es.n_valid < min_valid) return false;
+
+    cv::Matx66d H = cv::Matx66d::zeros();
+    cv::Vec6d g = cv::Vec6d::zeros();
+    ws.abs_e.clear();
+
+    for (size_t i = 0; i < tpl.points.size(); ++i) {
+        if (!ws.es.valid[i]) continue;
+        const double e = -ws.es.off[i];
+        const double ae = std::abs(e);
+        ws.abs_e.push_back(ae);
+        const double w = (ae <= huber) ? 1.0 : huber / std::max(ae, 1e-9);
+        accum_scalar_triple_eq(ws.pr[i][0], ws.pr[i][1], ws.pr[i][2],
+                               ws.X[i], ws.Y[i], ws.iz[i],
+                               ws.n_img[i].x, ws.n_img[i].y, K, e, w, H, g);
+    }
+    mirror_upper_sym_6x6(H);
+    double tr = 0.0;
+    for (int k = 0; k < 6; ++k) tr += H(k, k);
+    const double damp = damp_scale * tr / 6.0 + damp_eps;
+    for (int k = 0; k < 6; ++k) H(k, k) += damp;
+
+    if (!solve_6x6(H, g, out_dx)) return false;
+    if (!apply_lie_step(R, t, out_dx)) return false;
+
+    if (!ws.abs_e.empty()) {
+        std::sort(ws.abs_e.begin(), ws.abs_e.end());
+        out_med = ws.abs_e[ws.abs_e.size() / 2];
+        const size_t idx90 = static_cast<size_t>(std::round(0.90 * static_cast<double>(ws.abs_e.size() - 1)));
+        out_p90 = ws.abs_e[idx90];
+    }
+    out_frac = static_cast<double>(ws.es.n_valid) / static_cast<double>(tpl.points.size());
+    return true;
+}
+
 void refine_edges_lie(const cv::Mat& gs,
                       cv::Matx33d& R,
                       cv::Vec3d& t,
@@ -603,44 +655,112 @@ void refine_edges_lie(const cv::Mat& gs,
                       double huber = 1.5) {
     out_med = std::numeric_limits<double>::quiet_NaN();
     out_frac = 0.0;
-    const int min_valid = std::min(12, std::max(6, static_cast<int>(tpl.points.size()) / 2));
-
     for (int rad : radii) {
-        project_points_and_normals(tpl, R, t, K, ws, true);
-        edge_search(gs, ws.uv, ws.n_img, rad, ws.es);
-        if (ws.es.n_valid < min_valid) break;
-
-        cv::Matx66d H = cv::Matx66d::zeros();
-        cv::Vec6d g = cv::Vec6d::zeros();
-        ws.abs_e.clear();
-
-        for (size_t i = 0; i < tpl.points.size(); ++i) {
-            if (!ws.es.valid[i]) continue;
-            const double e = -ws.es.off[i];
-            const double ae = std::abs(e);
-            ws.abs_e.push_back(ae);
-            const double w = (ae <= huber) ? 1.0 : huber / std::max(ae, 1e-9);
-            accum_scalar_triple_eq(ws.pr[i][0], ws.pr[i][1], ws.pr[i][2],
-                                   ws.X[i], ws.Y[i], ws.iz[i],
-                                   ws.n_img[i].x, ws.n_img[i].y, K, e, w, H, g);
-        }
-        mirror_upper_sym_6x6(H);
-        double tr = 0.0;
-        for (int k = 0; k < 6; ++k) tr += H(k, k);
-        const double damp = 1e-6 * tr / 6.0 + 1e-12;
-        for (int k = 0; k < 6; ++k) H(k, k) += damp;
-
+        double p90 = 0.0;
         cv::Vec6d dx;
-        if (!solve_6x6(H, g, dx)) break;
-        if (!apply_lie_step(R, t, dx)) break;
-
-        if (!ws.abs_e.empty()) {
-            std::nth_element(ws.abs_e.begin(), ws.abs_e.begin() + ws.abs_e.size() / 2, ws.abs_e.end());
-            out_med = ws.abs_e[ws.abs_e.size() / 2];
+        if (!run_single_edge_step(gs, tpl, K, rad, huber, 1e-6, 1e-12, R, t, ws,
+                                  out_med, p90, out_frac, dx)) {
+            break;
         }
-        out_frac = static_cast<double>(ws.es.n_valid) / static_cast<double>(tpl.points.size());
         if (rad <= 3 && est_pixel_step(dx, r_mm, t[2], K) < 0.04) break;
     }
+}
+
+void eval_edge_residual_fixed(const cv::Mat& gs,
+                              const cv::Matx33d& R,
+                              const cv::Vec3d& t,
+                              const CharTemplate& tpl,
+                              const CameraIntrinsics& K,
+                              int rad,
+                              SolverWorkspace& ws,
+                              double& out_med,
+                              double& out_frac) {
+    out_med = std::numeric_limits<double>::quiet_NaN();
+    out_frac = 0.0;
+    project_points_and_normals(tpl, R, t, K, ws, false);
+    edge_search(gs, ws.uv, ws.n_img, rad, ws.es);
+    if (ws.es.n_valid <= 0) return;
+    ws.abs_e.clear();
+    for (size_t i = 0; i < tpl.points.size(); ++i) {
+        if (ws.es.valid[i]) ws.abs_e.push_back(std::abs(ws.es.off[i]));
+    }
+    if (ws.abs_e.empty()) return;
+    std::nth_element(ws.abs_e.begin(), ws.abs_e.begin() + ws.abs_e.size() / 2, ws.abs_e.end());
+    out_med = ws.abs_e[ws.abs_e.size() / 2];
+    out_frac = static_cast<double>(ws.es.n_valid) / static_cast<double>(tpl.points.size());
+}
+
+void refine_edges_lie_adaptive(const cv::Mat& gs,
+                               cv::Matx33d& R,
+                               cv::Vec3d& t,
+                               const CharTemplate& tpl,
+                               const CameraIntrinsics& K,
+                               int edge_steps,
+                               int r0,
+                               SolverWorkspace& ws,
+                               double r_mm,
+                               double& out_med,
+                               double& out_frac) {
+    int cur_rad = std::max(3, r0);
+    for (int it = 0; it < edge_steps; ++it) {
+        double step_med = 0.0, step_p90 = 0.0, step_frac = 0.0;
+        cv::Vec6d dx;
+        if (!run_single_edge_step(gs, tpl, K, cur_rad, 1.5, 1e-5, 1e-11, R, t, ws,
+                                  step_med, step_p90, step_frac, dx)) {
+            break;
+        }
+        if (it + 1 < edge_steps) {
+            if (cur_rad <= 3 && est_pixel_step(dx, r_mm, t[2], K) < 0.03) break;
+            cur_rad = std::clamp(static_cast<int>(std::ceil(std::max(2.0 * step_p90, 3.0))),
+                                 3, std::min(5, r0));
+        }
+    }
+    eval_edge_residual_fixed(gs, R, t, tpl, K, 4, ws, out_med, out_frac);
+}
+
+cv::Mat build_led_masked_sub_f32(const cv::Mat& gray,
+                                 int ix0,
+                                 int iy0,
+                                 int ix1,
+                                 int iy1,
+                                 int x0,
+                                 int y0,
+                                 int x1,
+                                 int y1,
+                                 double led_thr,
+                                 double bg_med) {
+    cv::Mat sub;
+    gray(cv::Rect(x0, y0, x1 - x0, y1 - y0)).convertTo(sub, CV_32F);
+    const int oy0 = iy0 - y0, oy1 = iy1 - y0;
+    const int ox0 = ix0 - x0, ox1 = ix1 - x0;
+    for (int y = 0; y < sub.rows; ++y) {
+        float* row = sub.ptr<float>(y);
+        const bool y_out = (y < oy0 || y >= oy1);
+        for (int x = 0; x < sub.cols; ++x) {
+            if ((y_out || x < ox0 || x >= ox1) && row[x] > led_thr) {
+                row[x] = static_cast<float>(bg_med);
+            }
+        }
+    }
+    return sub;
+}
+
+void linear_quantile_range(std::vector<float>& vals, double q_lo, double q_hi, float& out_lo, float& out_hi) {
+    if (vals.empty()) {
+        out_lo = 0.0f;
+        out_hi = 0.0f;
+        return;
+    }
+    std::sort(vals.begin(), vals.end());
+    auto at_q = [&](double q) -> float {
+        const double pos = std::clamp(q, 0.0, 1.0) * static_cast<double>(vals.size() - 1);
+        const size_t lo = static_cast<size_t>(std::floor(pos));
+        const size_t hi = std::min(lo + 1, vals.size() - 1);
+        const double frac = pos - static_cast<double>(lo);
+        return static_cast<float>(vals[lo] * (1.0 - frac) + vals[hi] * frac);
+    };
+    out_lo = at_q(q_lo);
+    out_hi = at_q(q_hi);
 }
 
 double boundary_phot_contrast(const cv::Mat& gs,
@@ -878,20 +998,7 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
     const int y1 = std::min(H_im, static_cast<int>(std::ceil(std::max(by1, max_cy))) + margin + 1);
     if (x1 <= x0 + 1 || y1 <= y0 + 1 || K.fx <= 1.0 || K.fy <= 1.0) return res;
 
-    cv::Mat sub_u8 = gray(cv::Rect(x0, y0, x1 - x0, y1 - y0));
-    cv::Mat sub;
-    sub_u8.convertTo(sub, CV_32F);
-    const int oy0 = iy0 - y0, oy1 = iy1 - y0;
-    const int ox0 = ix0 - x0, ox1 = ix1 - x0;
-    for (int y = 0; y < sub.rows; ++y) {
-        float* row = sub.ptr<float>(y);
-        const bool y_out = (y < oy0 || y >= oy1);
-        for (int x = 0; x < sub.cols; ++x) {
-            if ((y_out || x < ox0 || x >= ox1) && row[x] > led_thr) {
-                row[x] = static_cast<float>(bg_med);
-            }
-        }
-    }
+    cv::Mat sub = build_led_masked_sub_f32(gray, ix0, iy0, ix1, iy1, x0, y0, x1, y1, led_thr, bg_med);
 
     CameraIntrinsics Kc = K;
     Kc.cx -= x0;
@@ -1055,6 +1162,270 @@ PoseResult SparseEdgePoseSolver::solve_cold_start(const cv::Mat& gray,
 
     const auto& best = refined[0];
     res.valid = true;
+    res.rvec = mat_to_rvec(best.R);
+    res.tvec = best.t;
+    res.euler_yxz_deg = rvec_to_euler_yxz_deg(res.rvec);
+    res.edge_med_px = best.med;
+    res.edge_frac = best.frac;
+    res.phot_contrast = best.phot;
+    res.mirror_gap = std::numeric_limits<double>::infinity();
+    for (size_t i = 1; i < refined.size(); ++i) {
+        if (rot_err_deg(best.R, refined[i].R) > 10.0) {
+            res.mirror_gap = (best.phot - refined[i].phot) / std::max(std::abs(best.phot), 1.0);
+            break;
+        }
+    }
+    const auto t_end = std::chrono::steady_clock::now();
+    res.solve_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    return res;
+}
+
+RoiCornerPrior::RoiCornerPrior(const std::string& onnx_path) {
+    net_ = cv::dnn::readNetFromONNX(onnx_path);
+    if (net_.empty()) {
+        throw std::runtime_error("Failed to load corner prior ONNX: " + onnx_path);
+    }
+    net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+    net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    const auto cv_names = net_.getUnconnectedOutLayersNames();
+    out_names_.assign(cv_names.begin(), cv_names.end());
+}
+
+bool RoiCornerPrior::predict(const cv::Mat& gray_u8,
+                             const cv::Rect2f& box,
+                             int cls_id,
+                             std::array<cv::Point2d, 4>& out_corners) const {
+    if (net_.empty() || out_names_.empty() || gray_u8.empty()) return false;
+
+    cv::Mat gray1;
+    if (gray_u8.channels() == 1 && gray_u8.depth() == CV_8U) {
+        gray1 = gray_u8;
+    } else if (gray_u8.channels() == 3) {
+        cv::cvtColor(gray_u8, gray1, cv::COLOR_BGR2GRAY);
+        if (gray1.depth() != CV_8U) gray1.convertTo(gray1, CV_8U);
+    } else {
+        gray_u8.convertTo(gray1, CV_8U);
+    }
+
+    constexpr int kRoiSz = 64;
+    constexpr double kPadScale = 1.48;
+    const double bw = std::max(static_cast<double>(box.width), 4.0);
+    const double bh = std::max(static_cast<double>(box.height), 4.0);
+    const double cx = static_cast<double>(box.x) + 0.5 * static_cast<double>(box.width);
+    const double cy = static_cast<double>(box.y) + 0.5 * static_cast<double>(box.height);
+    const double S = std::max(kPadScale * std::max(bw, bh), 12.0);
+    const double x0 = cx - 0.5 * S;
+    const double y0 = cy - 0.5 * S;
+
+    const float scale = static_cast<float>(kRoiSz / S);
+    const cv::Matx23f M(scale, 0.0f, static_cast<float>(-x0 * kRoiSz / S),
+                        0.0f, scale, static_cast<float>(-y0 * kRoiSz / S));
+    cv::Mat patch_u8;
+    const int interp = (S > static_cast<double>(kRoiSz)) ? cv::INTER_AREA : cv::INTER_LINEAR;
+    cv::warpAffine(gray1, patch_u8, M, cv::Size(kRoiSz, kRoiSz), interp, cv::BORDER_REPLICATE);
+
+    const int ix0 = std::clamp(static_cast<int>(std::floor((box.x - x0) * kRoiSz / S)), 0, kRoiSz - 2);
+    const int iy0 = std::clamp(static_cast<int>(std::floor((box.y - y0) * kRoiSz / S)), 0, kRoiSz - 2);
+    const int ix1 = std::clamp(static_cast<int>(std::ceil((box.x + box.width - x0) * kRoiSz / S)), ix0 + 2, kRoiSz);
+    const int iy1 = std::clamp(static_cast<int>(std::ceil((box.y + box.height - y0) * kRoiSz / S)), iy0 + 2, kRoiSz);
+
+    std::vector<float> core_vals;
+    core_vals.reserve(static_cast<size_t>((iy1 - iy0) * (ix1 - ix0)));
+    for (int y = iy0; y < iy1; ++y) {
+        const uchar* row = patch_u8.ptr<uchar>(y);
+        for (int x = ix0; x < ix1; ++x) {
+            core_vals.push_back(static_cast<float>(row[x]));
+        }
+    }
+    float lo = 0.0f, hi = 255.0f;
+    linear_quantile_range(core_vals, 0.05, 0.95, lo, hi);
+    const float inv_span = 1.0f / std::max(hi - lo, 12.0f);
+
+    const int dims[4] = {1, 1, kRoiSz, kRoiSz};
+    cv::Mat blob(4, dims, CV_32F);
+    float* dst = blob.ptr<float>();
+    for (int y = 0; y < kRoiSz; ++y) {
+        const uchar* row = patch_u8.ptr<uchar>(y);
+        for (int x = 0; x < kRoiSz; ++x) {
+            const float norm_v = (static_cast<float>(row[x]) - lo) * inv_span;
+            dst[y * kRoiSz + x] = std::clamp(norm_v, 0.0f, 1.0f);
+        }
+    }
+
+    cv::Mat out_raw;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        net_.setInput(blob);
+        out_raw = net_.forward(out_names_[0]);
+    }
+    if (out_raw.empty() || out_raw.total() < 24) return false;
+    cv::Mat out_f = out_raw.isContinuous() ? out_raw : out_raw.clone();
+    if (out_f.depth() != CV_32F) out_f.convertTo(out_f, CV_32F);
+
+    const int cid = std::clamp(cls_id, 0, 2);
+    const float* coords = out_f.ptr<float>() + cid * 8;
+    for (int k = 0; k < 4; ++k) {
+        const double ux = static_cast<double>(coords[2 * k]);
+        const double uy = static_cast<double>(coords[2 * k + 1]);
+        if (!std::isfinite(ux) || !std::isfinite(uy)) return false;
+        out_corners[k] = cv::Point2d(x0 + ux * S, y0 + uy * S);
+    }
+    return true;
+}
+
+PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
+                                                         const cv::Rect2f& box,
+                                                         const CharTemplate& tpl,
+                                                         const CameraIntrinsics& K,
+                                                         const RoiCornerPrior* corner_prior,
+                                                         int margin) {
+    if (!corner_prior || corner_prior->empty()) {
+        return solve_cold_start(gray, box, tpl, K, margin);
+    }
+    const auto t_start = std::chrono::steady_clock::now();
+    PoseResult res;
+    if (gray.empty() || tpl.points.empty() || K.fx <= 1.0 || K.fy <= 1.0) return res;
+
+    auto fallback = [&]() {
+        PoseResult fb = solve_cold_start(gray, box, tpl, K, margin);
+        if (fb.valid) {
+            fb.used_fallback = true;
+            fb.solve_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t_start)
+                              .count();
+        }
+        return fb;
+    };
+
+    std::array<cv::Point2d, 4> p4{};
+    if (!corner_prior->predict(gray, box, tpl.cls_id, p4)) {
+        return fallback();
+    }
+
+    const double hw = 0.5 * tpl.width_mm;
+    const double hh = 0.5 * tpl.height_mm;
+    const std::vector<cv::Point3d> rect3 = {
+        cv::Point3d(-hw, -hh, 0.0),
+        cv::Point3d( hw, -hh, 0.0),
+        cv::Point3d( hw,  hh, 0.0),
+        cv::Point3d(-hw,  hh, 0.0),
+    };
+    const std::vector<cv::Point2d> img4(p4.begin(), p4.end());
+    const cv::Mat K_mat = (cv::Mat_<double>(3, 3) <<
+        K.fx, 0.0, K.cx,
+        0.0, K.fy, K.cy,
+        0.0, 0.0, 1.0);
+    std::vector<cv::Mat> rvecs, tvecs;
+    const int n_sol = cv::solvePnPGeneric(
+        rect3, img4, K_mat, cv::noArray(), rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
+    if (n_sol <= 0 || rvecs.empty() || tvecs.empty()) {
+        return fallback();
+    }
+
+    const int W_im = gray.cols;
+    const int H_im = gray.rows;
+    const double bx0 = box.x;
+    const double by0 = box.y;
+    const double bx1 = box.x + box.width;
+    const double by1 = box.y + box.height;
+    const double bh = std::max(by1 - by0, 4.0);
+
+    double min_px = bx0, max_px = bx1, min_py = by0, max_py = by1;
+    for (const auto& pt : p4) {
+        min_px = std::min(min_px, pt.x);
+        max_px = std::max(max_px, pt.x);
+        min_py = std::min(min_py, pt.y);
+        max_py = std::max(max_py, pt.y);
+    }
+    const int roi_pad = std::max(margin, 18);
+    const int x0 = std::max(0, static_cast<int>(std::floor(min_px)) - roi_pad);
+    const int y0 = std::max(0, static_cast<int>(std::floor(min_py)) - roi_pad);
+    const int x1 = std::min(W_im, static_cast<int>(std::ceil(max_px)) + roi_pad + 1);
+    const int y1 = std::min(H_im, static_cast<int>(std::ceil(max_py)) + roi_pad + 1);
+    if (x1 <= x0 + 2 || y1 <= y0 + 2) return fallback();
+
+    const int ix0 = std::clamp(static_cast<int>(std::floor(bx0)), x0, x1 - 1);
+    const int iy0 = std::clamp(static_cast<int>(std::floor(by0)), y0, y1 - 1);
+    const int ix1 = std::clamp(static_cast<int>(std::ceil(bx1)), ix0 + 1, x1);
+    const int iy1 = std::clamp(static_cast<int>(std::ceil(by1)), iy0 + 1, y1);
+    const cv::Mat core = gray(cv::Rect(ix0, iy0, ix1 - ix0, iy1 - iy0));
+
+    cv::Mat sub;
+    if (core.total() >= 16) {
+        double bg_med = 0.0, p95_in = 0.0;
+        compute_hist_percentiles_u8(core, bg_med, p95_in);
+        const double led_thr = std::max(p95_in * 1.5, 80.0);
+        sub = build_led_masked_sub_f32(gray, ix0, iy0, ix1, iy1, x0, y0, x1, y1, led_thr, bg_med);
+    } else {
+        gray(cv::Rect(x0, y0, x1 - x0, y1 - y0)).convertTo(sub, CV_32F);
+    }
+    cv::Mat gs;
+    cv::GaussianBlur(sub, gs, cv::Size(0, 0), 1.0);
+
+    CameraIntrinsics Kc = K;
+    Kc.cx -= x0;
+    Kc.cy -= y0;
+    std::array<cv::Point2d, 4> pts_roi{};
+    for (int k = 0; k < 4; ++k) {
+        pts_roi[k] = cv::Point2d(p4[k].x - x0, p4[k].y - y0);
+    }
+
+    const int r0 = std::clamp(static_cast<int>(std::round(0.035 * bh)), 4, 8);
+    const int edge_steps = (bh < 58.0) ? 1 : 3;
+    const double r_mm = 0.5 * std::hypot(tpl.width_mm, tpl.height_mm);
+    SolverWorkspace ws;
+    ws.reserve(tpl.points.size());
+
+    std::vector<RefinedCand> refined;
+    refined.reserve(2);
+    const int n_try = std::min(n_sol, 2);
+    for (int si = 0; si < n_try; ++si) {
+        cv::Mat rm = rvecs[si].isContinuous() ? rvecs[si] : rvecs[si].clone();
+        cv::Mat tm = tvecs[si].isContinuous() ? tvecs[si] : tvecs[si].clone();
+        if (rm.depth() != CV_64F) rm.convertTo(rm, CV_64F);
+        if (tm.depth() != CV_64F) tm.convertTo(tm, CV_64F);
+        if (rm.total() < 3 || tm.total() < 3) continue;
+
+        const double* rp = rm.ptr<double>();
+        const double* tp = tm.ptr<double>();
+        cv::Matx33d R = exp_so3(rp[0], rp[1], rp[2]);
+        cv::Vec3d t(tp[0], tp[1], tp[2]);
+        if (!is_finite_pose(R, t)) continue;
+
+        double med = 0.0, frac = 0.0;
+        refine_edges_lie_adaptive(gs, R, t, tpl, Kc, edge_steps, r0, ws, r_mm, med, frac);
+        if (!std::isfinite(med) || !is_finite_pose(R, t)) continue;
+
+        const double phot = boundary_phot_contrast(gs, tpl, R, t, Kc, ws);
+        if (!std::isfinite(phot)) continue;
+
+        double c_rep = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            const double X = R(0, 0) * rect3[k].x + R(0, 1) * rect3[k].y + t[0];
+            const double Y = R(1, 0) * rect3[k].x + R(1, 1) * rect3[k].y + t[1];
+            const double Z = std::max(R(2, 0) * rect3[k].x + R(2, 1) * rect3[k].y + t[2], 1e-6);
+            const double px = Kc.fx * (X / Z) + Kc.cx;
+            const double py = Kc.fy * (Y / Z) + Kc.cy;
+            c_rep += std::hypot(px - pts_roi[k].x, py - pts_roi[k].y);
+        }
+        c_rep *= 0.25;
+
+        const double sc = phot * (frac * frac)
+                        - 2.0 * std::max(med - 0.5, 0.0)
+                        - 60.0 * (c_rep / std::max(bh, 20.0));
+        refined.push_back({R, t, sc, phot, med, frac});
+    }
+    if (refined.empty()) return fallback();
+
+    std::sort(refined.begin(), refined.end(),
+              [](const RefinedCand& a, const RefinedCand& b) { return a.score > b.score; });
+    const auto& best = refined[0];
+    if (best.med > 0.70 || best.frac < 0.58) {
+        return fallback();
+    }
+
+    res.valid = true;
+    res.used_fallback = false;
     res.rvec = mat_to_rvec(best.R);
     res.tvec = best.t;
     res.euler_yxz_deg = rvec_to_euler_yxz_deg(res.rvec);

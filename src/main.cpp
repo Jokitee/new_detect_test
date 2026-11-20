@@ -78,7 +78,10 @@ struct Args {
     std::string image_path;
     std::string video_path;
     std::string model_path = "assets/ifl_net_v2_448x336.onnx";
+    std::string corner_model_path = "assets/roi_corner_v2_64x64.onnx";
     std::string templates_path = "assets/templates.csv";
+    bool use_corner_prior = true;
+    bool corner_model_explicit = false;
     std::string out_path;
     std::string roi_str;
     std::string cls_name = "1";
@@ -121,6 +124,8 @@ void print_usage() {
         << "  --image <path>       Single image inference -> PNG output\n\n"
         << "Detection & Pure-M1 Pose options:\n"
         << "  --model <onnx>       ONNX path (default assets/ifl_net_v2_448x336.onnx)\n"
+        << "  --corner-model <onnx> 64x64 ROI corner prior ONNX (default assets/roi_corner_v2_64x64.onnx)\n"
+        << "  --no-corner-prior    Disable 64x64 corner prior and run Pure-M1 Tier-1 cold-start only\n"
         << "  --templates <csv>    3D sparse contour CSV (default assets/templates.csv)\n"
         << "  --imgsz <int>        Square detector input size override (e.g. 416 for YOLOv8n)\n"
         << "  --det-w <int>        Detector input width (default 448, or 416 if YOLOv8 416)\n"
@@ -174,6 +179,10 @@ Args parse_args(int argc, char** argv) {
             a.mode = InputMode::Image;
             a.image_path = next();
         } else if (k == "--model") a.model_path = next();
+        else if (k == "--corner-model") {
+            a.corner_model_path = next();
+            a.corner_model_explicit = true;
+        } else if (k == "--no-corner-prior") a.use_corner_prior = false;
         else if (k == "--templates") a.templates_path = next();
         else if (k == "--out") a.out_path = next();
         else if (k == "--roi") a.roi_str = next();
@@ -333,6 +342,7 @@ FrameMetrics process_frame(const cv::Mat& frame,
                            const std::vector<tav_pose::CharTemplate>& bank,
                            const tav_pose::CameraIntrinsics& K,
                            const Args& args,
+                           const tav_pose::RoiCornerPrior* corner_prior,
                            TrackState* track_state,
                            cv::Mat& vis_out,
                            bool trace_frame0 = false) {
@@ -386,8 +396,8 @@ FrameMetrics process_frame(const cv::Mat& frame,
                 PoseTarget item;
                 item.det = solve_dets[i];
                 item.tpl = tpls[i];
-                item.pose = tav_pose::SparseEdgePoseSolver::solve_cold_start(
-                    gray, solve_dets[i].box, *tpls[i], K);
+                item.pose = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                    gray, solve_dets[i].box, *tpls[i], K, corner_prior);
                 metrics.targets[i] = std::move(item);
             };
             if (n_solve > 1) {
@@ -597,6 +607,7 @@ private:
 
 int run_image_mode(const Args& args,
                    const tav_pose::YoloDetector* detector,
+                   const tav_pose::RoiCornerPrior* corner_prior,
                    const std::vector<tav_pose::CharTemplate>& bank) {
     std::ifstream imf(fs::u8path(args.image_path), std::ios::binary | std::ios::ate);
     if (!imf.is_open()) {
@@ -625,7 +636,8 @@ int run_image_mode(const Args& args,
     }
 
     cv::Mat vis;
-    const FrameMetrics metrics = process_frame(work_bgr, gray, detector, bank, K, args, nullptr, vis);
+    const FrameMetrics metrics = process_frame(
+        work_bgr, gray, detector, bank, K, args, corner_prior, nullptr, vis);
 
     std::printf("Image: %s (%dx%d), f=%.1f px, detections=%zu, det_time=%.2f ms\n",
                 args.image_path.c_str(), gray.cols, gray.rows, K.fx,
@@ -638,21 +650,27 @@ int run_image_mode(const Args& args,
                         i, item.det.cls_name.c_str(), item.det.conf);
             continue;
         }
+        const char* mode_tag =
+            (!corner_prior || corner_prior->empty()) ? "Pure-M1" :
+            (item.pose.used_fallback ? "Hybrid->M1-FB" : "Hybrid-V2");
         std::printf("  [%zu] cls=%s conf=%.2f box=[%.0f, %.0f, %.0f, %.0f]\n",
                     i, item.det.cls_name.c_str(), item.det.conf,
                     item.det.box.x, item.det.box.y,
                     item.det.box.x + item.det.box.width,
                     item.det.box.y + item.det.box.height);
-        std::printf("      M1 (Pure C++): ypr=(%+.1f, %+.1f, %+.1f) deg  t=(%+.1f, %+.1f, %.1f)mm  "
+        std::printf("      Pose (%s): ypr=(%+.1f, %+.1f, %+.1f) deg  t=(%+.1f, %+.1f, %.1f)mm  "
                     "edge=%.2fpx (%.0f%%)  mirror_gap=%.3f  time=%.2f ms\n",
-                    item.pose.euler_yxz_deg[0], item.pose.euler_yxz_deg[1],
+                    mode_tag, item.pose.euler_yxz_deg[0], item.pose.euler_yxz_deg[1],
                     item.pose.euler_yxz_deg[2], item.pose.tvec[0], item.pose.tvec[1],
                     item.pose.tvec[2], item.pose.edge_med_px, 100.0 * item.pose.edge_frac,
                     item.pose.mirror_gap, item.pose.solve_ms);
 
         if (args.bench_runs > 0 && item.tpl) {
-            double sum_cold = 0.0, sum_trk = 0.0;
+            double sum_hybrid = 0.0, sum_cold = 0.0, sum_trk = 0.0;
             for (int r = 0; r < args.bench_runs; ++r) {
+                sum_hybrid += tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                                  gray, item.det.box, *item.tpl, K, corner_prior)
+                                  .solve_ms;
                 sum_cold += tav_pose::SparseEdgePoseSolver::solve_cold_start(
                                 gray, item.det.box, *item.tpl, K)
                                 .solve_ms;
@@ -660,8 +678,9 @@ int run_image_mode(const Args& args,
                                gray, item.pose.rvec, item.pose.tvec, *item.tpl, K)
                                .solve_ms;
             }
-            std::printf("      Benchmark (%d runs): cold_avg=%.3f ms  track_avg=%.3f ms\n",
-                        args.bench_runs, sum_cold / args.bench_runs, sum_trk / args.bench_runs);
+            std::printf("      Benchmark (%d runs): hybrid_avg=%.3f ms  pure_m1_avg=%.3f ms  track_avg=%.3f ms\n",
+                        args.bench_runs, sum_hybrid / args.bench_runs,
+                        sum_cold / args.bench_runs, sum_trk / args.bench_runs);
         }
     }
 
@@ -689,6 +708,7 @@ int run_image_mode(const Args& args,
 
 int run_stream_mode(const Args& args,
                     const tav_pose::YoloDetector* detector,
+                    const tav_pose::RoiCornerPrior* corner_prior,
                     const std::vector<tav_pose::CharTemplate>& bank) {
     tav_pose::MvCamera mv_cam;
     cv::VideoCapture video_cap;
@@ -811,7 +831,7 @@ int run_stream_mode(const Args& args,
         }
 
         const FrameMetrics metrics = process_frame(
-            frame, gray, detector, bank, K, args,
+            frame, gray, detector, bank, K, args, corner_prior,
             args.track ? &track_state : nullptr, vis, frame_idx == 0);
 
         const auto now_tick = std::chrono::steady_clock::now();
@@ -927,10 +947,27 @@ int main(int argc, char** argv) {
                       << ", conf=" << args.conf << ")" << std::endl;
         }
 
-        if (args.mode == InputMode::Image) {
-            return run_image_mode(args, detector.get(), bank);
+        std::unique_ptr<tav_pose::RoiCornerPrior> corner_prior;
+        if (args.use_corner_prior && !args.corner_model_path.empty()) {
+            std::error_code ec;
+            const bool exists = fs::exists(fs::u8path(args.corner_model_path), ec);
+            if (exists) {
+                corner_prior = std::make_unique<tav_pose::RoiCornerPrior>(args.corner_model_path);
+                std::cout << "[Init] CornerPrior: " << args.corner_model_path << " (64x64 Hybrid Option-A)" << std::endl;
+            } else if (args.corner_model_explicit) {
+                throw std::runtime_error("Corner prior model not found: " + args.corner_model_path);
+            } else {
+                std::cout << "[Init] CornerPrior not found at " << args.corner_model_path
+                          << ", falling back to Pure-M1 Tier-1 cold-start." << std::endl;
+            }
+        } else {
+            std::cout << "[Init] CornerPrior disabled (Pure-M1 Tier-1 cold-start)." << std::endl;
         }
-        return run_stream_mode(args, detector.get(), bank);
+
+        if (args.mode == InputMode::Image) {
+            return run_image_mode(args, detector.get(), corner_prior.get(), bank);
+        }
+        return run_stream_mode(args, detector.get(), corner_prior.get(), bank);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;

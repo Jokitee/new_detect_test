@@ -80,6 +80,7 @@ private:
     cv::Mat last_undistorted_bgr_;
 
     std::unique_ptr<tav_pose::YoloDetector> detector_;
+    std::unique_ptr<tav_pose::RoiCornerPrior> corner_prior_;
     std::vector<tav_pose::CharTemplate> templates_;
 
     bool has_prev_track_ = false;

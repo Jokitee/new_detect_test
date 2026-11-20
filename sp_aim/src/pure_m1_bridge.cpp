@@ -94,6 +94,7 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     enemy_color_ = (enemy_str == "blue") ? auto_aim::Color::blue : auto_aim::Color::red;
 
     const std::string model_rel = read_yaml_or<std::string>(yaml, "ifl_model_path", "assets/ifl_net_v2_448x336.onnx");
+    const std::string corner_rel = read_yaml_or<std::string>(yaml, "ifl_corner_model_path", "assets/roi_corner_v2_64x64.onnx");
     const std::string tpl_rel = read_yaml_or<std::string>(yaml, "ifl_templates_path", "assets/templates.csv");
     const int det_w = read_yaml_or<int>(yaml, "ifl_det_w", 448);
     const int det_h = read_yaml_or<int>(yaml, "ifl_det_h", 336);
@@ -123,6 +124,14 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     detector_ = std::make_unique<tav_pose::YoloDetector>(
         model_path, cls_names, det_w, det_h, conf, nms, use_gray);
 
+    if (!corner_rel.empty()) {
+        const std::string corner_path = resolve_path(corner_rel, config_path);
+        std::error_code ec;
+        if (fs::exists(fs::u8path(corner_path), ec)) {
+            corner_prior_ = std::make_unique<tav_pose::RoiCornerPrior>(corner_path);
+        }
+    }
+
     if (yaml["camera_matrix"] && yaml["camera_matrix"].size() == 9) {
         const auto cv_vec = yaml["camera_matrix"].as<std::vector<double>>();
         K_base_.fx = cv_vec[0];
@@ -141,8 +150,9 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     K_last_ = K_base_;
 
     tools::logger()->info(
-        "[PureM1Bridge] model='{}' conf={:.2f} templates={} K_base=({:.1f},{:.1f},{:.1f},{:.1f}) undistort={}",
-        model_path, conf, templates_.size(), K_base_.fx, K_base_.fy, K_base_.cx, K_base_.cy,
+        "[PureM1Bridge] model='{}' corner='{}' conf={:.2f} templates={} K_base=({:.1f},{:.1f},{:.1f},{:.1f}) undistort={}",
+        model_path, (corner_prior_ && !corner_prior_->empty()) ? "64x64-hybrid" : "none",
+        conf, templates_.size(), K_base_.fx, K_base_.fy, K_base_.cx, K_base_.cy,
         use_undistort_);
 }
 
@@ -370,16 +380,16 @@ std::list<SolvedArmor> PureM1ArmorDetector::detect(const cv::Mat& raw_bgr,
     if (dets.size() == 1) {
         const auto& d = dets[0];
         if (d.cls_id >= 0 && d.cls_id < static_cast<int>(templates_.size())) {
-            poses[0] = tav_pose::SparseEdgePoseSolver::solve_cold_start(
-                gray, d.box, templates_[d.cls_id], K_last_, 14);
+            poses[0] = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                gray, d.box, templates_[d.cls_id], K_last_, corner_prior_.get(), 14);
         }
     } else if (dets.size() > 1) {
         cv::parallel_for_(cv::Range(0, static_cast<int>(dets.size())), [&](const cv::Range& range) {
             for (int i = range.start; i < range.end; ++i) {
                 const auto& d = dets[i];
                 if (d.cls_id >= 0 && d.cls_id < static_cast<int>(templates_.size())) {
-                    poses[i] = tav_pose::SparseEdgePoseSolver::solve_cold_start(
-                        gray, d.box, templates_[d.cls_id], K_last_, 14);
+                    poses[i] = tav_pose::SparseEdgePoseSolver::solve_cold_start_hybrid(
+                        gray, d.box, templates_[d.cls_id], K_last_, corner_prior_.get(), 14);
                 }
             }
         });
