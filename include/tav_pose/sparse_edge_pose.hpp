@@ -10,7 +10,7 @@
 
 namespace tav_pose {
 
-/// Thread-safe L1/L2-resident 64x64 isotropic ROI virtual-corner predictor (`RoiCornerNetV2`).
+/// Thread-safe L1/L2-resident isotropic ROI virtual-corner predictor (`RoiCornerNetV2`, 64x64 or 48x48).
 class RoiCornerPrior {
 public:
     RoiCornerPrior() = default;
@@ -20,6 +20,7 @@ public:
     RoiCornerPrior& operator=(const RoiCornerPrior&) = delete;
 
     bool empty() const noexcept { return net_.empty(); }
+    int roi_sz() const noexcept { return roi_sz_; }
 
     /// Predicts 4 ordered image-space corners corresponding to template rect3:
     /// [-W/2,-H/2], [W/2,-H/2], [W/2,H/2], [-W/2,H/2].
@@ -32,6 +33,7 @@ private:
     mutable cv::dnn::Net net_;
     mutable std::mutex mu_;
     std::vector<std::string> out_names_;
+    int roi_sz_ = 64;
 };
 
 class SparseEdgePoseSolver {
@@ -45,15 +47,15 @@ public:
 
     /// Hybrid Option-A cold-start: 64x64 RoiCornerPrior + Dual-IPPE + adaptive 1~3-step Lie 1D Edge,
     /// with automatic safety fallback to Tier-1 `solve_cold_start` if residual or coverage fails gate.
-    /// When `sparse_1d_raw` is true (O1n_pe), skips full-ROI float/LED-mask/GaussianBlur and samples
-    /// raw uint8 along contour normals with 5-tap [1,4,6,4,1]/16 1D smoothing.
+    /// When `sparse_1d_raw` is true (O1n_pe, default), skips full-ROI float/LED-mask/GaussianBlur
+    /// and samples raw uint8 along contour normals with 5-tap [1,4,6,4,1]/16 1D smoothing.
     static PoseResult solve_cold_start_hybrid(const cv::Mat& gray,
                                               const cv::Rect2f& box,
                                               const CharTemplate& tpl,
                                               const CameraIntrinsics& K,
                                               const RoiCornerPrior* corner_prior,
                                               int margin = 14,
-                                              bool sparse_1d_raw = false);
+                                              bool sparse_1d_raw = true);
 
     /// Temporal tracking mode: refines directly from previous frame's (rvec, tvec).
     static PoseResult solve_tracking(const cv::Mat& gray,

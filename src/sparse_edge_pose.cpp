@@ -188,12 +188,21 @@ inline float sample_bilinear_u8_masked(const cv::Mat& raw_u8,
 }
 
 void compute_hist_percentiles_u8(const cv::Mat& core, double& p50, double& p95) {
+    if (core.empty()) {
+        p50 = 0.0;
+        p95 = 0.0;
+        return;
+    }
     std::array<int, 256> hist{};
-    const int total = core.rows * core.cols;
-    for (int y = 0; y < core.rows; ++y) {
+    // Bound sampling to ~64x64 grid so huge close-up ROIs (e.g. 1280x1024) stay O(1).
+    const int step_y = std::max(1, core.rows / 64);
+    const int step_x = std::max(1, core.cols / 64);
+    int total = 0;
+    for (int y = 0; y < core.rows; y += step_y) {
         const uchar* row = core.ptr<uchar>(y);
-        for (int x = 0; x < core.cols; ++x) {
+        for (int x = 0; x < core.cols; x += step_x) {
             hist[row[x]]++;
+            ++total;
         }
     }
     const int target50 = static_cast<int>(std::round(0.50 * (total - 1)));
@@ -786,8 +795,10 @@ void refine_edges_lie_adaptive(const EdgeImgSource& src,
                                double r_mm,
                                double& out_med,
                                double& out_frac,
-                               double& out_phot) {
+                               double& out_phot,
+                               int eval_rad = 4) {
     int cur_rad = std::max(3, r0);
+    const int next_max = std::clamp(eval_rad + 1, 5, 8);
     for (int it = 0; it < edge_steps; ++it) {
         double step_med = 0.0, step_p90 = 0.0, step_frac = 0.0;
         cv::Vec6d dx;
@@ -798,10 +809,10 @@ void refine_edges_lie_adaptive(const EdgeImgSource& src,
         if (it + 1 < edge_steps) {
             if (cur_rad <= 3 && est_pixel_step(dx, r_mm, t[2], K) < 0.03) break;
             cur_rad = std::clamp(static_cast<int>(std::ceil(std::max(2.0 * step_p90, 3.0))),
-                                 3, std::min(5, r0));
+                                 3, std::min(next_max, r0));
         }
     }
-    eval_edge_residual_and_phot(src, R, t, tpl, K, 4, ws, out_med, out_frac, out_phot);
+    eval_edge_residual_and_phot(src, R, t, tpl, K, eval_rad, ws, out_med, out_frac, out_phot);
 }
 
 cv::Mat build_led_masked_sub_f32(const cv::Mat& gray,
@@ -1287,6 +1298,32 @@ RoiCornerPrior::RoiCornerPrior(const std::string& onnx_path) {
     net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     const auto cv_names = net_.getUnconnectedOutLayersNames();
     out_names_.assign(cv_names.begin(), cv_names.end());
+
+    if (onnx_path.find("32x32") != std::string::npos) {
+        roi_sz_ = 32;
+    } else if (onnx_path.find("48x48") != std::string::npos) {
+        roi_sz_ = 48;
+    } else if (onnx_path.find("64x64") != std::string::npos) {
+        roi_sz_ = 64;
+    } else if (!out_names_.empty()) {
+        roi_sz_ = 64;
+        for (int cand : {64, 48, 32}) {
+            try {
+                cv::dnn::Net probe = cv::dnn::readNetFromONNX(onnx_path);
+                probe.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+                probe.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+                const int dims[4] = {1, 1, cand, cand};
+                cv::Mat dummy = cv::Mat::zeros(4, dims, CV_32F);
+                probe.setInput(dummy);
+                cv::Mat y = probe.forward(out_names_[0]);
+                if (!y.empty() && y.total() >= 24) {
+                    roi_sz_ = cand;
+                    break;
+                }
+            } catch (...) {
+            }
+        }
+    }
 }
 
 bool RoiCornerPrior::predict(const cv::Mat& gray_u8,
@@ -1297,7 +1334,7 @@ bool RoiCornerPrior::predict(const cv::Mat& gray_u8,
 
     const cv::Mat gray1 = ensure_gray_u8(gray_u8);
 
-    constexpr int kRoiSz = 64;
+    const int kRoiSz = roi_sz_;
     constexpr double kPadScale = 1.48;
     const double bw = std::max(static_cast<double>(box.width), 4.0);
     const double bh = std::max(static_cast<double>(box.height), 4.0);
@@ -1492,7 +1529,8 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
     const auto t_prep = Clock::now();
     res.timing.roi_prep_ms = ms_between(t_ippe, t_prep);
 
-    const int r0 = std::clamp(static_cast<int>(std::round(0.035 * bh)), 4, 8);
+    const int r0 = std::clamp(static_cast<int>(std::round(0.035 * bh)), 4, 16);
+    const int eval_rad = std::clamp(static_cast<int>(std::round(0.012 * bh)), 4, 8);
     const int edge_steps = (bh < 58.0) ? 1 : 3;
     const double r_mm = 0.5 * std::hypot(tpl.width_mm, tpl.height_mm);
     SolverWorkspace ws;
@@ -1515,7 +1553,7 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
         if (!is_finite_pose(R, t)) continue;
 
         double med = 0.0, frac = 0.0, phot = 0.0;
-        refine_edges_lie_adaptive(edge_src, R, t, tpl, Kc, edge_steps, r0, ws, r_mm, med, frac, phot);
+        refine_edges_lie_adaptive(edge_src, R, t, tpl, Kc, edge_steps, r0, ws, r_mm, med, frac, phot, eval_rad);
         if (!std::isfinite(med) || !std::isfinite(phot) || !is_finite_pose(R, t)) continue;
 
         double c_rep = 0.0;
@@ -1542,7 +1580,8 @@ PoseResult SparseEdgePoseSolver::solve_cold_start_hybrid(const cv::Mat& gray,
     std::sort(refined.begin(), refined.end(),
               [](const RefinedCand& a, const RefinedCand& b) { return a.score > b.score; });
     const auto& best = refined[0];
-    if (best.med > 0.70 || best.frac < 0.58) {
+    const double med_gate = std::max(0.70, 0.0025 * bh);
+    if (best.med > med_gate || best.frac < 0.58) {
         return fallback();
     }
 

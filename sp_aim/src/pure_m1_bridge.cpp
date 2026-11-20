@@ -107,7 +107,7 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     m1_min_edge_frac_ = read_yaml_or<double>(yaml, "m1_min_edge_frac", 0.22);
     m1_max_edge_med_px_ = read_yaml_or<double>(yaml, "m1_max_edge_med_px", 2.50);
     use_tracking_ = read_yaml_or<bool>(yaml, "m1_track", false);
-    fast_1d_ = read_yaml_or<bool>(yaml, "m1_fast_1d", false);
+    fast_1d_ = read_yaml_or<bool>(yaml, "m1_fast_1d", true);
     redetect_every_ = std::max(1, read_yaml_or<int>(yaml, "m1_redetect_every", 15));
     one_as_big_ = read_yaml_or<bool>(yaml, "ifl_one_as_big", true);
     color_mode_ = read_yaml_or<std::string>(yaml, "ifl_color_mode", "auto");
@@ -150,9 +150,13 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     }
     K_last_ = K_base_;
 
+    const std::string corner_tag =
+        (corner_prior_ && !corner_prior_->empty())
+            ? (std::to_string(corner_prior_->roi_sz()) + "x" + std::to_string(corner_prior_->roi_sz()) + "-hybrid")
+            : "none";
     tools::logger()->info(
         "[PureM1Bridge] model='{}' corner='{}' conf={:.2f} templates={} K_base=({:.1f},{:.1f},{:.1f},{:.1f}) undistort={}",
-        model_path, (corner_prior_ && !corner_prior_->empty()) ? "64x64-hybrid" : "none",
+        model_path, corner_tag,
         conf, templates_.size(), K_base_.fx, K_base_.fy, K_base_.cx, K_base_.cy,
         use_undistort_);
 }

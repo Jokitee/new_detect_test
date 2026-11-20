@@ -82,7 +82,7 @@ struct Args {
     std::string templates_path = "assets/templates.csv";
     bool use_corner_prior = true;
     bool corner_model_explicit = false;
-    bool fast_1d = false;
+    bool fast_1d = true;
     std::string out_path;
     std::string roi_str;
     std::string cls_name = "1";
@@ -125,9 +125,10 @@ void print_usage() {
         << "  --image <path>       Single image inference -> PNG output\n\n"
         << "Detection & Pure-M1 Pose options:\n"
         << "  --model <onnx>       ONNX path (default assets/ifl_net_v2_448x336.onnx)\n"
-        << "  --corner-model <onnx> 64x64 ROI corner prior ONNX (default assets/roi_corner_v2_64x64.onnx)\n"
+        << "  --corner-model <onnx> 64x64/48x48 ROI corner prior ONNX (default assets/roi_corner_v2_64x64.onnx)\n"
         << "  --no-corner-prior    Disable 64x64 corner prior and run Pure-M1 Tier-1 cold-start only\n"
-        << "  --fast-1d            Skip full-ROI blur/float prep (O1n_pe: 1D normal sampling + 5-tap smooth)\n"
+        << "  --fast-1d            (Default on) 1D normal sampling + 5-tap smooth (O1n_pe)\n"
+        << "  --full-roi-blur      Use legacy full-ROI float/LED-mask/GaussianBlur prep (B_pe)\n"
         << "  --templates <csv>    3D sparse contour CSV (default assets/templates.csv)\n"
         << "  --imgsz <int>        Square detector input size override (e.g. 416 for YOLOv8n)\n"
         << "  --det-w <int>        Detector input width (default 448, or 416 if YOLOv8 416)\n"
@@ -186,6 +187,7 @@ Args parse_args(int argc, char** argv) {
             a.corner_model_explicit = true;
         } else if (k == "--no-corner-prior") a.use_corner_prior = false;
         else if (k == "--fast-1d") a.fast_1d = true;
+        else if (k == "--full-roi-blur") a.fast_1d = false;
         else if (k == "--templates") a.templates_path = next();
         else if (k == "--out") a.out_path = next();
         else if (k == "--roi") a.roi_str = next();
@@ -998,7 +1000,9 @@ int main(int argc, char** argv) {
             const bool exists = fs::exists(fs::u8path(args.corner_model_path), ec);
             if (exists) {
                 corner_prior = std::make_unique<tav_pose::RoiCornerPrior>(args.corner_model_path);
-                std::cout << "[Init] CornerPrior: " << args.corner_model_path << " (64x64 Hybrid Option-A)" << std::endl;
+                std::cout << "[Init] CornerPrior: " << args.corner_model_path
+                          << " (" << corner_prior->roi_sz() << "x" << corner_prior->roi_sz()
+                          << " Hybrid Option-A)" << std::endl;
             } else if (args.corner_model_explicit) {
                 throw std::runtime_error("Corner prior model not found: " + args.corner_model_path);
             } else {
