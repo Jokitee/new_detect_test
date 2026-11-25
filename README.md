@@ -7,26 +7,46 @@ Pure-M1 character detection & 6DoF pose estimation in C++17 (`IFL-Net V2-Slim 44
 - `xmake.lua` — xmake build script (uses local/system OpenCV by default without downloading; links `MVSDK`, C++17, `fastest`)
 - `include/tav_pose/` — `types.hpp`, `yolo_detector.hpp`, `sparse_edge_pose.hpp`, `mv_camera.hpp`
 - `src/` — `yolo_detector.cpp`, `sparse_edge_pose.cpp`, `mv_camera.cpp`, `main.cpp`
-- `assets/ifl_net_v2_448x336.onnx` — Default 3-scale (`P2+P3+P4`), 3-class (`1`, `3`, `sentary`) IFL-Net V2-Slim ONNX (`448x336`, `opset=12`)
+- `assets/ifl_net_v2_448x336.onnx` — Default 3-scale (`P2+P3+P4`), 3-class (`1`, `3`, `sentary`) IFL-Net V2-Direct ONNX (`448x336`, `opset=12`)
+- `assets/roi_corner_v2_64x64.onnx` — Default `64x64` RoiCornerNetV2 ONNX (`Hybrid Option-A + O1n_pe`)
+- `assets/roi_corner_v2_48x48.onnx` — Optional compact `48x48` corner prior ONNX (`tiny48_fc`, ~2.4x faster CNN)
 - `assets/char3_det_416.onnx` — Optional 3-class YOLOv8n detect ONNX (`416x416`, `opset=12`)
 - `assets/templates.csv` — 64-point 3D planar contour templates with tangents and outward normals
 
-## Build (Linux VM / NUC)
+## Build (Raspberry Pi 5 `aarch64` & Intel NUC / Linux VM `x86_64`)
 
-By default `xmake.lua` automatically searches your local/system OpenCV (`--opencv_dir`, `$OpenCV_DIR`, `~/install`, `/usr/local`, `/usr`, `pkg-config`, `cmake`) and will **not** download OpenCV from `xmake-repo`.
+`xmake.lua` automatically adapts to both **Raspberry Pi 5 (`arm64` / `aarch64`)** and **Intel NUC (`x86_64`)**:
+- Searches local/system OpenCV first (`--opencv_dir`, `$OpenCV_DIR`, `~/install`, `/usr/local`, `/usr`, `/usr/include/{aarch64,x86_64}-linux-gnu/opencv4`, `pkg-config`, `cmake`) without downloading.
+- Searches MindVision SDK headers (`CameraApi.h`) and architecture-matched `libMVSDK.so` (`lib/arm64` on Pi 5, `lib/x64` on NUC, or `/usr/lib`, `/usr/local/lib`) with automatic `rpath` injection.
 
+### 1. Install Dependencies
+```bash
+# Ubuntu / Debian / Raspberry Pi OS (NUC & Raspberry Pi 5)
+sudo apt update
+sudo apt install -y build-essential git pkg-config cmake libopencv-dev
+
+# Optional: only needed if building sp_ekf_test inside sp_aim/
+sudo apt install -y libeigen3-dev libfmt-dev libspdlog-dev libyaml-cpp-dev nlohmann-json3-dev
+```
+> **MindVision SDK (`MVSDK`) note**: Download MindVision Linux SDK and install the library matching your board architecture (`arm64` for Raspberry Pi 5, `x64` for Intel NUC), or pass `--mvsdk_dir=/path/to/linuxSDK` directly without global installation. Add MindVision udev rules (`88-mvusb.rules`) or run with USB write permission so `USBDEVFS_RESET` recovery works without `sudo`.
+
+### 2. Configure & Build
 ```bash
 cd ~/RM/new_detect_test
 git pull
-xmake f -c -m release
-xmake
+xmake f -c -m release   # Always re-configure (-c) when switching between Pi 5 (arm64) and NUC (x86_64)
+xmake -j$(nproc)
 ```
 
 Useful configure options:
-- Specify your custom OpenCV 4.13 install directory explicitly: `xmake f -c -m release --opencv_dir=$HOME/install`
-- Only if you want xmake to download OpenCV from `xmake-repo`: `xmake f -c -m release --use_xrepo=true --opencv_ver=4.13.x`
-- Build without MindVision SDK (offline `--image` / `--video` only): `xmake f -c -m release --with_mvsdk=false`
-- Custom MindVision SDK directory: `xmake f -c -m release --mvsdk_dir=/path/to/MindVisionSDK`
+- Specify custom OpenCV 4.10~4.13 install prefix (recommended on Pi 5 if system `apt` OpenCV is `< 4.8`): `xmake f -c -m release --opencv_dir=$HOME/install`
+- Custom unpacked MindVision SDK directory (auto-picks `lib/arm64` on Pi 5 or `lib/x64` on NUC): `xmake f -c -m release --mvsdk_dir=$HOME/linuxSDK_V2`
+- Build without MindVision SDK (offline `--image` / `--video` testing on any board): `xmake f -c -m release --with_mvsdk=false`
+- Build from `xmake-repo` (NUC recommended only; **avoid on 4GB Raspberry Pi 5** due to slow/OOM source compilation): `xmake f -c -m release --use_xrepo=true --opencv_ver=4.13.x`
+
+> **Raspberry Pi 5 runtime tips**:
+> - Under Wayland / SSH headless environments, pass `--no-show`.
+> - Lock threads if needed with `--threads 4` (Pi 5 has 4 Cortex-A76 cores), and optionally test `--corner-model assets/roi_corner_v2_48x48.onnx` for lower ARM64 CPU load.
 
 ## Run Modes
 
