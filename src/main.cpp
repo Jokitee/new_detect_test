@@ -83,6 +83,7 @@ struct Args {
     bool use_corner_prior = true;
     bool corner_model_explicit = false;
     bool fast_1d = true;
+    tav_pose::GpuMode gpu_mode = tav_pose::GpuMode::Auto;
     std::string out_path;
     std::string roi_str;
     std::string cls_name = "1";
@@ -159,6 +160,8 @@ void print_usage() {
         << "  --codec <FOURCC>     Optional 4-char VideoWriter codec (e.g. MJPG, mp4v, XVID)\n"
         << "  --max-frames <N>     Optional frame limit (default 0 = unlimited until Ctrl+C/q/ESC)\n"
         << "  --threads <int>      Optional cv::setNumThreads(N) (e.g. 1 if VM OpenCV hangs)\n"
+        << "  --gpu <auto|on|off>  OpenCV DNN GPU acceleration (default auto: CUDA/OpenCL if faster)\n"
+        << "  --cpu                Force CPU-only inference (alias for --gpu off)\n"
         << "  --show               Display cv::imshow window (already enabled by default in camera/video mode)\n"
         << "  --no-show            Disable cv::imshow window (headless recording)\n";
 }
@@ -215,6 +218,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--redetect-every") a.redetect_every = std::max(1, std::stoi(next()));
         else if (k == "--max-targets") a.max_targets = std::max(0, std::stoi(next()));
         else if (k == "--threads") a.threads = std::max(1, std::stoi(next()));
+        else if (k == "--gpu") a.gpu_mode = tav_pose::parse_gpu_mode(next());
+        else if (k == "--cpu") a.gpu_mode = tav_pose::GpuMode::Off;
         else if (k == "--bgr") a.use_bgr = true;
         else if (k == "--show") a.force_show = true;
         else if (k == "--no-show") a.no_show = true;
@@ -989,9 +994,9 @@ int main(int argc, char** argv) {
             names.reserve(bank.size());
             for (const auto& t : bank) names.push_back(t.name);
             detector = std::make_unique<tav_pose::YoloDetector>(
-                args.model_path, std::move(names), dw, dh, args.conf, 0.45f, !args.use_bgr);
+                args.model_path, std::move(names), dw, dh, args.conf, 0.45f, !args.use_bgr, args.gpu_mode);
             std::cout << "[Init] Detector: " << args.model_path << " (" << dw << "x" << dh
-                      << ", conf=" << args.conf << ")" << std::endl;
+                      << ", conf=" << args.conf << ", backend=" << detector->backend_status().summary << ")" << std::endl;
         }
 
         std::unique_ptr<tav_pose::RoiCornerPrior> corner_prior;
@@ -999,10 +1004,10 @@ int main(int argc, char** argv) {
             std::error_code ec;
             const bool exists = fs::exists(fs::u8path(args.corner_model_path), ec);
             if (exists) {
-                corner_prior = std::make_unique<tav_pose::RoiCornerPrior>(args.corner_model_path);
+                corner_prior = std::make_unique<tav_pose::RoiCornerPrior>(args.corner_model_path, args.gpu_mode);
                 std::cout << "[Init] CornerPrior: " << args.corner_model_path
                           << " (" << corner_prior->roi_sz() << "x" << corner_prior->roi_sz()
-                          << " Hybrid Option-A)" << std::endl;
+                          << " Hybrid Option-A, backend=" << corner_prior->backend_status().summary << ")" << std::endl;
             } else if (args.corner_model_explicit) {
                 throw std::runtime_error("Corner prior model not found: " + args.corner_model_path);
             } else {

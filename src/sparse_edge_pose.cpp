@@ -1289,13 +1289,11 @@ cv::Mat ensure_gray_u8(const cv::Mat& src) {
     return gray1;
 }
 
-RoiCornerPrior::RoiCornerPrior(const std::string& onnx_path) {
+RoiCornerPrior::RoiCornerPrior(const std::string& onnx_path, GpuMode gpu_mode) {
     net_ = cv::dnn::readNetFromONNX(onnx_path);
     if (net_.empty()) {
         throw std::runtime_error("Failed to load corner prior ONNX: " + onnx_path);
     }
-    net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     const auto cv_names = net_.getUnconnectedOutLayersNames();
     out_names_.assign(cv_names.begin(), cv_names.end());
 
@@ -1324,6 +1322,8 @@ RoiCornerPrior::RoiCornerPrior(const std::string& onnx_path) {
             }
         }
     }
+    backend_status_ = configure_dnn_backend(
+        net_, onnx_path, out_names_, cv::Size(roi_sz_, roi_sz_), 1, gpu_mode);
 }
 
 bool RoiCornerPrior::predict(const cv::Mat& gray_u8,

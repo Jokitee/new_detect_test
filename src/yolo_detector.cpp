@@ -49,7 +49,8 @@ YoloDetector::YoloDetector(const std::string& onnx_path,
                            int input_h,
                            float conf_thresh,
                            float nms_thresh,
-                           bool use_gray_3ch)
+                           bool use_gray_3ch,
+                           GpuMode gpu_mode)
     : class_names_(std::move(class_names)),
       input_w_(input_w),
       input_h_(input_h),
@@ -60,10 +61,10 @@ YoloDetector::YoloDetector(const std::string& onnx_path,
     if (net_.empty()) {
         throw std::runtime_error("Failed to load ONNX model: " + onnx_path);
     }
-    net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     const auto cv_names = net_.getUnconnectedOutLayersNames();
     out_names_.assign(cv_names.begin(), cv_names.end());
+    backend_status_ = configure_dnn_backend(
+        net_, onnx_path, out_names_, cv::Size(input_w_, input_h_), 3, gpu_mode);
 }
 
 void YoloDetector::decode_yolov8(const cv::Mat& out_raw,

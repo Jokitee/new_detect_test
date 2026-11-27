@@ -101,6 +101,8 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     const float conf = read_yaml_or<float>(yaml, "ifl_conf", 0.45f);
     const float nms = read_yaml_or<float>(yaml, "ifl_nms", 0.45f);
     const bool use_gray = read_yaml_or<bool>(yaml, "ifl_use_gray", true);
+    const std::string gpu_str = read_yaml_or<std::string>(yaml, "ifl_gpu_mode", "auto");
+    const tav_pose::GpuMode gpu_mode = tav_pose::parse_gpu_mode(gpu_str);
 
     use_undistort_ = read_yaml_or<bool>(yaml, "ifl_use_undistort", true);
     m1_gate_enable_ = read_yaml_or<bool>(yaml, "m1_gate_enable", true);
@@ -123,13 +125,13 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
     if (cls_names.empty()) cls_names = {"1", "3", "sentary"};
 
     detector_ = std::make_unique<tav_pose::YoloDetector>(
-        model_path, cls_names, det_w, det_h, conf, nms, use_gray);
+        model_path, cls_names, det_w, det_h, conf, nms, use_gray, gpu_mode);
 
     if (!corner_rel.empty()) {
         const std::string corner_path = resolve_path(corner_rel, config_path);
         std::error_code ec;
         if (fs::exists(fs::u8path(corner_path), ec)) {
-            corner_prior_ = std::make_unique<tav_pose::RoiCornerPrior>(corner_path);
+            corner_prior_ = std::make_unique<tav_pose::RoiCornerPrior>(corner_path, gpu_mode);
         }
     }
 
@@ -154,9 +156,12 @@ PureM1ArmorDetector::PureM1ArmorDetector(const std::string& config_path, bool de
         (corner_prior_ && !corner_prior_->empty())
             ? (std::to_string(corner_prior_->roi_sz()) + "x" + std::to_string(corner_prior_->roi_sz()) + "-hybrid")
             : "none";
+    const std::string det_be = detector_ ? detector_->backend_status().summary : "none";
+    const std::string c_be =
+        (corner_prior_ && !corner_prior_->empty()) ? corner_prior_->backend_status().summary : "none";
     tools::logger()->info(
-        "[PureM1Bridge] model='{}' corner='{}' conf={:.2f} templates={} K_base=({:.1f},{:.1f},{:.1f},{:.1f}) undistort={}",
-        model_path, corner_tag,
+        "[PureM1Bridge] model='{}' ({}) corner='{}' ({}) conf={:.2f} templates={} K_base=({:.1f},{:.1f},{:.1f},{:.1f}) undistort={}",
+        model_path, det_be, corner_tag, c_be,
         conf, templates_.size(), K_base_.fx, K_base_.fy, K_base_.cx, K_base_.cy,
         use_undistort_);
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "tav_pose/gpu_accel.hpp"
 #include "tav_pose/types.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>
@@ -14,13 +15,14 @@ namespace tav_pose {
 class RoiCornerPrior {
 public:
     RoiCornerPrior() = default;
-    explicit RoiCornerPrior(const std::string& onnx_path);
+    explicit RoiCornerPrior(const std::string& onnx_path, GpuMode gpu_mode = GpuMode::Auto);
 
     RoiCornerPrior(const RoiCornerPrior&) = delete;
     RoiCornerPrior& operator=(const RoiCornerPrior&) = delete;
 
     bool empty() const noexcept { return net_.empty(); }
     int roi_sz() const noexcept { return roi_sz_; }
+    const DnnBackendStatus& backend_status() const noexcept { return backend_status_; }
 
     /// Predicts 4 ordered image-space corners corresponding to template rect3:
     /// [-W/2,-H/2], [W/2,-H/2], [W/2,H/2], [-W/2,H/2].
@@ -34,6 +36,7 @@ private:
     mutable std::mutex mu_;
     std::vector<std::string> out_names_;
     int roi_sz_ = 64;
+    DnnBackendStatus backend_status_;
 };
 
 class SparseEdgePoseSolver {

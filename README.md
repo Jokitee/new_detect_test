@@ -44,7 +44,8 @@ Useful configure options:
 - Build without MindVision SDK (offline `--image` / `--video` testing on any board): `xmake f -c -m release --with_mvsdk=false`
 - Build from `xmake-repo` (NUC recommended only; **avoid on 4GB Raspberry Pi 5** due to slow/OOM source compilation): `xmake f -c -m release --use_xrepo=true --opencv_ver=4.13.x`
 
-> **Raspberry Pi 5 runtime tips**:
+> **Raspberry Pi 5 / NUC GPU runtime tips**:
+> - GPU acceleration is automatic (`--gpu auto`, default): probes NVIDIA CUDA (`CUDA-FP16` / `CUDA`) and hardware OpenCL iGPU/dGPU (`OpenCL-FP16` / `OpenCL`, ignoring software CPU OpenCL), benchmarks GPU vs CPU on startup, and automatically falls back to CPU if no GPU is faster or available. Force modes via `--gpu on` / `--gpu off` (`--cpu`) or `ifl_gpu_mode` in `sp_aim/configs/sp_ekf_test.yaml`.
 > - Under Wayland / SSH headless environments, pass `--no-show`.
 > - Lock threads if needed with `--threads 4` (Pi 5 has 4 Cortex-A76 cores), and optionally test `--corner-model assets/roi_corner_v2_48x48.onnx` for lower ARM64 CPU load.
 

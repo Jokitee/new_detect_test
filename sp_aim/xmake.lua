@@ -50,6 +50,7 @@ target("sp_ekf_test")
 
     -- Reuse TAV detector, Pure-M1 solver & hardened MindVision camera (NO original recognition code from sp_vision_25)
     add_files(
+        path.join(root_dir, "src", "gpu_accel.cpp"),
         path.join(root_dir, "src", "yolo_detector.cpp"),
         path.join(root_dir, "src", "sparse_edge_pose.cpp"),
         path.join(root_dir, "src", "mv_camera.cpp"),
